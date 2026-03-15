@@ -24,11 +24,6 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      - name: Write credentials file
-        env:
-          CREDS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-        run: python3 -c "import os,base64; open('service_account.json','wb').write(base64.b64decode(os.environ['CREDS_JSON']))"
-
       - name: Run scraper
         env:
           GOOGLE_SHEETS_CREDENTIALS: service_account.json
