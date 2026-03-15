@@ -27,7 +27,7 @@ jobs:
       - name: Write credentials file
         env:
           CREDS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-        run: python3 -c "import os; open('service_account.json','w').write(os.environ['CREDS_JSON'])"
+        run: python3 -c "import os,base64; open('service_account.json','wb').write(base64.b64decode(os.environ['CREDS_JSON']))"
 
       - name: Run scraper
         env:
