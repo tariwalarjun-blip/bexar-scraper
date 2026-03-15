@@ -3,6 +3,7 @@ Bexar County Foreclosure Scraper - Final
 - Goes directly to results URL (no form clicking needed)
 - Sorted by recorded date descending
 - Pages through ALL results until hitting a known recorded date
+- Splits address into Street, City, State, ZIP columns
 - New address → writes to sheet
 - Duplicate address → writes to sheet + texts you
 """
@@ -28,7 +29,6 @@ GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 SMS_TO             = "7262412180@vtext.com"
 
-# Direct results URL — Foreclosures dept, sorted by recorded date desc
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
@@ -59,13 +59,27 @@ def get_existing_data(sheet):
     for row in rows[1:]:
         if row[0].strip():
             existing_addresses.add(row[0].strip().upper())
-        if len(row) > 1 and row[1].strip():
-            existing_dates.add(row[1].strip())
+        if len(row) > 4 and row[4].strip():
+            existing_dates.add(row[4].strip())
     return existing_addresses, existing_dates
 
+def parse_address(full_address):
+    parts  = [p.strip() for p in full_address.split(",")]
+    street = parts[0] if len(parts) > 0 else full_address
+    city   = parts[1] if len(parts) > 1 else ""
+    state  = parts[2] if len(parts) > 2 else "TX"
+    zip_   = parts[3] if len(parts) > 3 else ""
+    state_map = {"TEXAS": "TX", "Texas": "TX"}
+    state = state_map.get(state.strip(), state.strip())
+    return street.strip(), city.strip(), state.strip(), zip_.strip()
+
 def append_row(sheet, address, recorded_date, sale_date):
-    sheet.append_row([address, recorded_date, sale_date, "", "Active", ""], value_input_option="USER_ENTERED")
-    log.info(f"  Written: {address} | {recorded_date}")
+    street, city, state, zip_ = parse_address(address)
+    sheet.append_row(
+        [street, city, state, zip_, recorded_date, sale_date, "Active", ""],
+        value_input_option="USER_ENTERED"
+    )
+    log.info(f"  Written: {street} | {city} | {state} | {zip_} | {recorded_date}")
 
 def scrape_foreclosures(existing_dates):
     results = []
@@ -94,14 +108,12 @@ def scrape_foreclosures(existing_dates):
                     cells     = row.locator("td").all()
                     cell_text = [c.inner_text().strip() for c in cells]
 
-                    # Skip header/footer rows (no dates)
                     dates = [v for v in cell_text if re.match(r"\d{1,2}/\d{1,2}/\d{4}", v)]
                     if not dates:
                         continue
 
                     data_rows += 1
 
-                    # Address: last cell with a number + word
                     address = ""
                     for val in reversed(cell_text):
                         if val and re.search(r"\d+\s+\w+", val):
@@ -111,7 +123,6 @@ def scrape_foreclosures(existing_dates):
                     recorded_date = dates[0]
                     sale_date     = dates[1] if len(dates) >= 2 else ""
 
-                    # Stop when we hit a date already in the sheet
                     if recorded_date in existing_dates:
                         log.info(f"  Hit known date {recorded_date} — stopping.")
                         done = True
@@ -132,7 +143,6 @@ def scrape_foreclosures(existing_dates):
             if done or data_rows == 0:
                 break
 
-            # If we got fewer than 50 data rows, we're on the last page
             if data_rows < 50:
                 log.info("  Last page reached.")
                 break
@@ -157,7 +167,8 @@ def main():
     new_count  = 0
     dupe_count = 0
     for f in foreclosures:
-        key = f["address"].strip().upper()
+        street, city, state, zip_ = parse_address(f["address"])
+        key = street.strip().upper()
         if not key:
             continue
 
