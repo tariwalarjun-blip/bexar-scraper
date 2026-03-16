@@ -3,6 +3,7 @@ Bexar County Foreclosure Scraper - v8
 - Writes to DateLookup tab (Address, recorded date, sale date) for reliable Zap lookup
 - Pings Zapier webhook for instant BatchLeads trigger
 - Smart stop, duplicate handling, address normalization, retry logic, crash SMS
+- 3 second sleep between writes to avoid Google Sheets rate limit
 """
 
 import os
@@ -170,7 +171,6 @@ def get_existing_data(sheet):
     return existing_addresses, most_recent_date
 
 def get_lookup_addresses(lookup_sheet):
-    """Returns dict of normalized address → row index in DateLookup tab."""
     rows = lookup_sheet.get_all_values()
     lookup = {}
     for i, row in enumerate(rows[1:], start=2):
@@ -191,46 +191,48 @@ def parse_address(full_address):
 def append_row(sheet, lookup_sheet, lookup_addresses, address, recorded_date, sale_date):
     street, city, state, zip_ = parse_address(address)
 
-    # Write to main sheet
     sheet.append_row(
         [street, city, state, zip_, recorded_date, sale_date, "", "Active", ""],
         value_input_option="USER_ENTERED",
     )
     log.info(f"  New row: {street} | {recorded_date}")
+    time.sleep(2)
 
-    # Write to DateLookup tab (upsert)
     key = street.upper()
     if key in lookup_addresses:
         row_idx = lookup_addresses[key]
         lookup_sheet.update_cell(row_idx, 2, recorded_date)
+        time.sleep(2)
         lookup_sheet.update_cell(row_idx, 3, sale_date)
     else:
         lookup_sheet.append_row(
             [street, recorded_date, sale_date],
             value_input_option="USER_ENTERED",
         )
+    time.sleep(2)
 
-    # Ping Zapier webhook
     ping_zapier(street, city, state, zip_, recorded_date, sale_date)
 
 def update_row(sheet, lookup_sheet, lookup_addresses, row_index, address, recorded_date, sale_date):
-    # Update main sheet dates
     sheet.update_cell(row_index, 5, recorded_date)
+    time.sleep(2)
     sheet.update_cell(row_index, 6, sale_date)
+    time.sleep(2)
     log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
 
-    # Update DateLookup tab too
     street, _, _, _ = parse_address(address)
     key = street.upper()
     if key in lookup_addresses:
         row_idx = lookup_addresses[key]
         lookup_sheet.update_cell(row_idx, 2, recorded_date)
+        time.sleep(2)
         lookup_sheet.update_cell(row_idx, 3, sale_date)
     else:
         lookup_sheet.append_row(
             [street, recorded_date, sale_date],
             value_input_option="USER_ENTERED",
         )
+    time.sleep(2)
 
 
 # ─────────────────────────────────────────────
@@ -367,7 +369,7 @@ def main():
                 append_row(sheet, lookup_sheet, lookup_addresses, f["address"], f["recorded_date"], f["sale_date"])
                 new_count += 1
 
-            time.sleep(1.5)
+            time.sleep(3)
 
         if new_count == 0 and update_count == 0:
             send_text("⚠️ Bexar scraper ran but found 0 records. Check county site manually.")
