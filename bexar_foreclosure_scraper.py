@@ -1,12 +1,8 @@
 """
-Bexar County Foreclosure Scraper - v7
-- Retries page if 0 data rows returned (handles empty page bug)
-- Texts you if scraper finds 0 records after all retries
-- Pings Zapier webhook directly for each new row (instant trigger)
-- Smart stop: stops when recorded date is older than most recent date in sheet
-- Duplicate handling: updates existing row instead of adding new row
-- Address normalization: USPS suffix abbreviations to match BatchLeads
-- Crash notification via SMS
+Bexar County Foreclosure Scraper - v8
+- Writes to DateLookup tab (Address, recorded date, sale date) for reliable Zap lookup
+- Pings Zapier webhook for instant BatchLeads trigger
+- Smart stop, duplicate handling, address normalization, retry logic, crash SMS
 """
 
 import os
@@ -29,6 +25,7 @@ load_dotenv()
 CREDENTIALS_FILE   = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
 SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
 SHEET_TAB          = "Sheet1"
+LOOKUP_TAB         = "DateLookup"
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 SMS_TO             = "7262412180@vtext.com"
@@ -146,13 +143,14 @@ def normalize_street(street):
 # Google Sheets
 # ─────────────────────────────────────────────
 
-def get_sheet():
+def get_sheets():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(SHEET_TAB)
+    wb = gspread.authorize(creds).open_by_key(SHEET_ID)
+    return wb.worksheet(SHEET_TAB), wb.worksheet(LOOKUP_TAB)
 
 def get_existing_data(sheet):
     rows = sheet.get_all_values()
@@ -171,6 +169,15 @@ def get_existing_data(sheet):
     most_recent_date = max(all_dates) if all_dates else None
     return existing_addresses, most_recent_date
 
+def get_lookup_addresses(lookup_sheet):
+    """Returns dict of normalized address → row index in DateLookup tab."""
+    rows = lookup_sheet.get_all_values()
+    lookup = {}
+    for i, row in enumerate(rows[1:], start=2):
+        if row and row[0].strip():
+            lookup[row[0].strip().upper()] = i
+    return lookup
+
 def parse_address(full_address):
     parts  = [p.strip() for p in full_address.split(",")]
     street = parts[0] if parts else full_address
@@ -181,19 +188,49 @@ def parse_address(full_address):
     state = state_map.get(state.strip(), state.strip())
     return normalize_street(street.strip()), city.strip(), state.strip(), zip_.strip()
 
-def append_row(sheet, address, recorded_date, sale_date):
+def append_row(sheet, lookup_sheet, lookup_addresses, address, recorded_date, sale_date):
     street, city, state, zip_ = parse_address(address)
+
+    # Write to main sheet
     sheet.append_row(
         [street, city, state, zip_, recorded_date, sale_date, "", "Active", ""],
         value_input_option="USER_ENTERED",
     )
     log.info(f"  New row: {street} | {recorded_date}")
+
+    # Write to DateLookup tab (upsert)
+    key = street.upper()
+    if key in lookup_addresses:
+        row_idx = lookup_addresses[key]
+        lookup_sheet.update_cell(row_idx, 2, recorded_date)
+        lookup_sheet.update_cell(row_idx, 3, sale_date)
+    else:
+        lookup_sheet.append_row(
+            [street, recorded_date, sale_date],
+            value_input_option="USER_ENTERED",
+        )
+
+    # Ping Zapier webhook
     ping_zapier(street, city, state, zip_, recorded_date, sale_date)
 
-def update_row(sheet, row_index, recorded_date, sale_date):
+def update_row(sheet, lookup_sheet, lookup_addresses, row_index, address, recorded_date, sale_date):
+    # Update main sheet dates
     sheet.update_cell(row_index, 5, recorded_date)
     sheet.update_cell(row_index, 6, sale_date)
     log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
+
+    # Update DateLookup tab too
+    street, _, _, _ = parse_address(address)
+    key = street.upper()
+    if key in lookup_addresses:
+        row_idx = lookup_addresses[key]
+        lookup_sheet.update_cell(row_idx, 2, recorded_date)
+        lookup_sheet.update_cell(row_idx, 3, sale_date)
+    else:
+        lookup_sheet.append_row(
+            [street, recorded_date, sale_date],
+            value_input_option="USER_ENTERED",
+        )
 
 
 # ─────────────────────────────────────────────
@@ -201,7 +238,6 @@ def update_row(sheet, row_index, recorded_date, sale_date):
 # ─────────────────────────────────────────────
 
 def scrape_page_with_retry(page, url, max_retries=3):
-    """Load a page and return rows. Retries up to max_retries if 0 data rows found."""
     for attempt in range(1, max_retries + 1):
         if not goto_with_retry(page, url):
             return []
@@ -298,12 +334,13 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v7")
+    log.info("Bexar County Foreclosure Scraper v8")
     log.info("=" * 60)
 
     try:
-        sheet = get_sheet()
+        sheet, lookup_sheet = get_sheets()
         existing_addresses, most_recent = get_existing_data(sheet)
+        lookup_addresses = get_lookup_addresses(lookup_sheet)
         log.info(
             f"Existing records: {len(existing_addresses)} | "
             f"Most recent date: {most_recent.strftime('%m/%d/%Y') if most_recent else 'none'}"
@@ -324,15 +361,14 @@ def main():
             row_index = existing_addresses.get(key)
 
             if row_index is not None:
-                update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
+                update_row(sheet, lookup_sheet, lookup_addresses, row_index, f["address"], f["recorded_date"], f["sale_date"])
                 update_count += 1
             else:
-                append_row(sheet, f["address"], f["recorded_date"], f["sale_date"])
+                append_row(sheet, lookup_sheet, lookup_addresses, f["address"], f["recorded_date"], f["sale_date"])
                 new_count += 1
 
             time.sleep(1.5)
 
-        # Alert if nothing was found at all — may indicate site issue
         if new_count == 0 and update_count == 0:
             send_text("⚠️ Bexar scraper ran but found 0 records. Check county site manually.")
 
