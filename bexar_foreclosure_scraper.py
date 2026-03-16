@@ -1,10 +1,11 @@
 """
-Bexar County Foreclosure Scraper - v6
+Bexar County Foreclosure Scraper - v7
+- Retries page if 0 data rows returned (handles empty page bug)
+- Texts you if scraper finds 0 records after all retries
 - Pings Zapier webhook directly for each new row (instant trigger)
 - Smart stop: stops when recorded date is older than most recent date in sheet
 - Duplicate handling: updates existing row instead of adding new row
 - Address normalization: USPS suffix abbreviations to match BatchLeads
-- Retry logic on page loads
 - Crash notification via SMS
 """
 
@@ -199,6 +200,21 @@ def update_row(sheet, row_index, recorded_date, sale_date):
 # Scraper
 # ─────────────────────────────────────────────
 
+def scrape_page_with_retry(page, url, max_retries=3):
+    """Load a page and return rows. Retries up to max_retries if 0 data rows found."""
+    for attempt in range(1, max_retries + 1):
+        if not goto_with_retry(page, url):
+            return []
+        time.sleep(3)
+        rows = page.locator("table tbody tr").all()
+        data_rows = [r for r in rows if re.search(r"\d{1,2}/\d{1,2}/\d{4}", r.inner_text())]
+        if data_rows:
+            return rows
+        log.warning(f"  0 data rows on attempt {attempt}/{max_retries} — retrying in 10s...")
+        time.sleep(10)
+    log.error("  Page returned 0 rows after all retries.")
+    return []
+
 def scrape_foreclosures(most_recent_date):
     results = []
     done    = False
@@ -219,15 +235,12 @@ def scrape_foreclosures(most_recent_date):
             url = BASE_URL.format(offset=offset)
             log.info(f"Loading page {page_num} (offset={offset})…")
 
-            if not goto_with_retry(page, url):
-                log.error(f"  Gave up after 3 retries on page {page_num}.")
+            rows = scrape_page_with_retry(page, url)
+            if not rows:
+                log.error(f"  Giving up on page {page_num} after retries.")
                 break
 
-            time.sleep(3)
-
-            rows      = page.locator("table tbody tr").all()
             data_rows = 0
-
             for row in rows:
                 try:
                     cells     = row.locator("td").all()
@@ -285,7 +298,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v6")
+    log.info("Bexar County Foreclosure Scraper v7")
     log.info("=" * 60)
 
     try:
@@ -318,6 +331,10 @@ def main():
                 new_count += 1
 
             time.sleep(1.5)
+
+        # Alert if nothing was found at all — may indicate site issue
+        if new_count == 0 and update_count == 0:
+            send_text("⚠️ Bexar scraper ran but found 0 records. Check county site manually.")
 
         log.info(f"Done. {new_count} new | {update_count} updated.")
 
