@@ -1,9 +1,9 @@
 """
-Bexar County Foreclosure Scraper - v5
-- Trustee extraction removed (was causing 6hr timeout)
-- Hard date limit: never goes back more than 30 days
+Bexar County Foreclosure Scraper - v6
+- Pings Zapier webhook directly for each new row (instant trigger)
 - Smart stop: stops when recorded date is older than most recent date in sheet
 - Duplicate handling: updates existing row instead of adding new row
+- Address normalization: USPS suffix abbreviations to match BatchLeads
 - Retry logic on page loads
 - Crash notification via SMS
 """
@@ -13,6 +13,8 @@ import re
 import time
 import logging
 import smtplib
+import json
+import urllib.request
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
@@ -29,8 +31,8 @@ SHEET_TAB          = "Sheet1"
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 SMS_TO             = "7262412180@vtext.com"
+ZAPIER_WEBHOOK_URL = "https://hooks.zapier.com/hooks/catch/26182087/upy4s7l/"
 
-# Never scrape further back than this many days
 MAX_DAYS_BACK = 30
 
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
@@ -100,6 +102,27 @@ def send_text(message):
     except Exception as e:
         log.warning(f"  Text failed: {e}")
 
+def ping_zapier(street, city, state, zip_, recorded_date, sale_date):
+    try:
+        payload = json.dumps({
+            "address": street,
+            "city": city,
+            "state": state,
+            "zip": zip_,
+            "recorded_date": recorded_date,
+            "sale_date": sale_date,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            ZAPIER_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log.info(f"  Zapier pinged: {street} → {resp.status}")
+    except Exception as e:
+        log.warning(f"  Zapier ping failed: {e}")
+
 def goto_with_retry(page, url, retries=3, delay=5):
     for attempt in range(1, retries + 1):
         try:
@@ -164,6 +187,7 @@ def append_row(sheet, address, recorded_date, sale_date):
         value_input_option="USER_ENTERED",
     )
     log.info(f"  New row: {street} | {recorded_date}")
+    ping_zapier(street, city, state, zip_, recorded_date, sale_date)
 
 def update_row(sheet, row_index, recorded_date, sale_date):
     sheet.update_cell(row_index, 5, recorded_date)
@@ -179,7 +203,6 @@ def scrape_foreclosures(most_recent_date):
     results = []
     done    = False
 
-    # Hard cutoff: never go back more than MAX_DAYS_BACK days
     hard_cutoff = datetime.now() - timedelta(days=MAX_DAYS_BACK)
     stop_date   = max(most_recent_date, hard_cutoff) if most_recent_date else hard_cutoff
     log.info(f"Stop date: {stop_date.strftime('%m/%d/%Y')}")
@@ -220,7 +243,7 @@ def scrape_foreclosures(most_recent_date):
 
                     rec_dt = parse_date(recorded_date)
                     if rec_dt and rec_dt < stop_date:
-                        log.info(f"  {recorded_date} < stop date {stop_date.strftime('%m/%d/%Y')} — stopping.")
+                        log.info(f"  {recorded_date} < stop date — stopping.")
                         done = True
                         break
 
@@ -262,7 +285,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v5")
+    log.info("Bexar County Foreclosure Scraper v6")
     log.info("=" * 60)
 
     try:
