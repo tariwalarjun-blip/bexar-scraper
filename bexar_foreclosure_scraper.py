@@ -1,7 +1,8 @@
 """
-Bexar County Foreclosure Scraper - v3
+Bexar County Foreclosure Scraper - v4
 - Smart stop: stops when recorded date is OLDER THAN most recent date in sheet
 - Duplicate handling: updates existing row with new dates instead of adding new row
+- Address normalization: converts street suffixes to USPS abbreviations to match BatchLeads
 - Substitute trustee extraction via Claude API
 - Retry logic on page loads
 - Crash notification via SMS
@@ -35,6 +36,44 @@ BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&sear
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
+
+SUFFIX_MAP = {
+    "ALLEY": "ALY", "AVENUE": "AVE", "BEND": "BND", "BLUFF": "BLF",
+    "BOULEVARD": "BLVD", "BRANCH": "BR", "BRIDGE": "BRG", "BROOK": "BRK",
+    "CANYON": "CYN", "CIRCLE": "CIR", "CLIFF": "CLF", "CLUB": "CLB",
+    "COMMON": "CMN", "CORNER": "COR", "COURT": "CT", "COVE": "CV",
+    "CREEK": "CRK", "CROSSING": "XING", "CROSSROAD": "XRD", "CURVE": "CURV",
+    "DALE": "DL", "DRIVE": "DR", "ESTATE": "EST", "EXPRESSWAY": "EXPY",
+    "EXTENSION": "EXT", "FALLS": "FLS", "FERRY": "FRY", "FIELD": "FLD",
+    "FIELDS": "FLDS", "FLAT": "FLT", "FORD": "FRD", "FOREST": "FRST",
+    "FORGE": "FRG", "FORK": "FRK", "FREEWAY": "FWY", "GARDEN": "GDN",
+    "GARDENS": "GDNS", "GATEWAY": "GTWY", "GLEN": "GLN", "GREEN": "GRN",
+    "GROVE": "GRV", "HARBOR": "HBR", "HAVEN": "HVN", "HEIGHTS": "HTS",
+    "HIGHWAY": "HWY", "HILL": "HL", "HILLS": "HLS", "HOLLOW": "HOLW",
+    "INLET": "INLT", "ISLAND": "IS", "ISLE": "ISLE", "JUNCTION": "JCT",
+    "KEY": "KY", "KNOLL": "KNL", "LAKE": "LK", "LAKES": "LKS",
+    "LANE": "LN", "LIGHT": "LGT", "LOAF": "LF", "LOCK": "LCK",
+    "LODGE": "LDG", "LOOP": "LOOP", "MALL": "MALL", "MANOR": "MNR",
+    "MEADOW": "MDW", "MEADOWS": "MDWS", "MILL": "ML", "MILLS": "MLS",
+    "MISSION": "MSN", "MOTORWAY": "MTWY", "MOUNT": "MT", "MOUNTAIN": "MTN",
+    "NECK": "NCK", "ORCHARD": "ORCH", "OVAL": "OVAL", "OVERPASS": "OPAS",
+    "PARK": "PARK", "PARKWAY": "PKWY", "PASS": "PASS", "PATH": "PATH",
+    "PIKE": "PIKE", "PINE": "PNE", "PINES": "PNES", "PLACE": "PL",
+    "PLAIN": "PLN", "PLAINS": "PLNS", "PLAZA": "PLZ", "POINT": "PT",
+    "POINTS": "PTS", "PORT": "PRT", "PRAIRIE": "PR", "RADIAL": "RADL",
+    "RAMP": "RAMP", "RANCH": "RNCH", "RAPID": "RPD", "RAPIDS": "RPDS",
+    "REST": "RST", "RIDGE": "RDG", "RIDGES": "RDGS", "RIVER": "RIV",
+    "ROAD": "RD", "ROADS": "RDS", "ROUTE": "RTE", "ROW": "ROW",
+    "RUN": "RUN", "SHOAL": "SHL", "SHOALS": "SHLS", "SHORE": "SHR",
+    "SHORES": "SHRS", "SKYWAY": "SKWY", "SPRING": "SPG", "SPRINGS": "SPGS",
+    "SPUR": "SPUR", "SQUARE": "SQ", "STREAM": "STRM", "STREET": "ST",
+    "SUMMIT": "SMT", "TERRACE": "TER", "THROUGHWAY": "TRWY", "TRACE": "TRCE",
+    "TRACK": "TRAK", "TRAIL": "TRL", "TUNNEL": "TUNL", "TURNPIKE": "TPKE",
+    "UNDERPASS": "UPAS", "UNION": "UN", "VALLEY": "VLY", "VIADUCT": "VIA",
+    "VIEW": "VW", "VILLAGE": "VLG", "VILLE": "VL", "VISTA": "VIS",
+    "WALK": "WALK", "WALL": "WALL", "WAY": "WAY", "WELL": "WL",
+    "WELLS": "WLS",
+}
 
 
 # ─────────────────────────────────────────────
@@ -70,6 +109,13 @@ def goto_with_retry(page, url, retries=3, delay=5):
             if attempt < retries:
                 time.sleep(delay)
     return False
+
+def normalize_street(street):
+    """Normalize street suffix to USPS abbreviation to match BatchLeads format."""
+    parts = street.upper().split()
+    if parts and parts[-1] in SUFFIX_MAP:
+        parts[-1] = SUFFIX_MAP[parts[-1]]
+    return " ".join(parts)
 
 
 # ─────────────────────────────────────────────
@@ -110,7 +156,7 @@ def parse_address(full_address):
     zip_   = parts[3] if len(parts) > 3 else ""
     state_map = {"TEXAS": "TX", "Texas": "TX"}
     state = state_map.get(state.strip(), state.strip())
-    return street.strip(), city.strip(), state.strip(), zip_.strip()
+    return normalize_street(street.strip()), city.strip(), state.strip(), zip_.strip()
 
 def append_row(sheet, address, recorded_date, sale_date, trustee=""):
     street, city, state, zip_ = parse_address(address)
@@ -286,7 +332,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v3")
+    log.info("Bexar County Foreclosure Scraper v4")
     log.info("=" * 60)
 
     try:
