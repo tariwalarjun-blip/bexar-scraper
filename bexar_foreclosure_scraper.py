@@ -1,10 +1,10 @@
 """
-Bexar County Foreclosure Scraper - v2
-Improvements over v1:
-- Smart stop condition: compares dates properly so it never misses same-day filings
-- Substitute trustee extraction via Claude API (requires ANTHROPIC_API_KEY secret)
-- Retry logic: retries failed page loads up to 3 times before giving up
-- Crash notification: texts you if the scraper crashes
+Bexar County Foreclosure Scraper - v3
+- Smart stop: stops when recorded date is older than most recent date in sheet
+- Duplicate handling: updates existing row with new dates instead of adding new row
+- Substitute trustee extraction via Claude API
+- Retry logic on page loads
+- Crash notification via SMS
 """
 
 import os
@@ -23,13 +23,13 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-CREDENTIALS_FILE  = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
-SHEET_ID          = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
-SHEET_TAB         = "Sheet1"
-GMAIL_USER        = os.environ["GMAIL_USER"]
+CREDENTIALS_FILE   = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
+SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
+SHEET_TAB          = "Sheet1"
+GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-SMS_TO            = "7262412180@vtext.com"
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+SMS_TO             = "7262412180@vtext.com"
 
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
 
@@ -90,9 +90,10 @@ def get_existing_data(sheet):
     all_dates = []
 
     for i, row in enumerate(rows[1:], start=2):
-        street = row[0].strip() if row else ""
+        street = row[0].strip() if len(row) > 0 else ""
         if street:
             existing_addresses[street.upper()] = i
+
         if len(row) > 4 and row[4].strip():
             d = parse_date(row[4])
             if d:
@@ -102,7 +103,7 @@ def get_existing_data(sheet):
     return existing_addresses, most_recent_date
 
 def parse_address(full_address):
-    parts = [p.strip() for p in full_address.split(",")]
+    parts  = [p.strip() for p in full_address.split(",")]
     street = parts[0] if parts else full_address
     city   = parts[1] if len(parts) > 1 else ""
     state  = parts[2] if len(parts) > 2 else "TX"
@@ -221,8 +222,8 @@ def scrape_foreclosures(most_recent_date):
                         rec_dt = parse_date(recorded_date)
                         if rec_dt and rec_dt <= most_recent_date:
                             log.info(
-                                f"  Recorded date {recorded_date} ≤ "
-                                f"most recent {most_recent_date.strftime('%m/%d/%Y')} — stopping."
+                                f"  {recorded_date} <= most recent "
+                                f"{most_recent_date.strftime('%m/%d/%Y')} — stopping."
                             )
                             done = True
                             break
@@ -285,11 +286,11 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v2")
+    log.info("Bexar County Foreclosure Scraper v3")
     log.info("=" * 60)
 
     try:
-        sheet                        = get_sheet()
+        sheet = get_sheet()
         existing_addresses, most_recent = get_existing_data(sheet)
         log.info(
             f"Existing records: {len(existing_addresses)} | "
@@ -308,13 +309,21 @@ def main():
             if not key:
                 continue
 
-            if key in existing_addresses:
-                row_index = existing_addresses[key]
+            row_index = existing_addresses.get(key)
+
+            if row_index is not None:
+                # Address already existed in sheet before this run — update dates
                 update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
                 update_count += 1
             else:
-                append_row(sheet, f["address"], f["recorded_date"], f["sale_date"], f.get("trustee", ""))
-                existing_addresses[key] = None
+                # Brand new address — append new row
+                append_row(
+                    sheet,
+                    f["address"],
+                    f["recorded_date"],
+                    f["sale_date"],
+                    f.get("trustee", ""),
+                )
                 new_count += 1
 
             time.sleep(1.5)
@@ -323,7 +332,7 @@ def main():
 
     except Exception as e:
         log.error(f"SCRAPER CRASHED: {e}")
-        send_text(f"⚠️ Bexar scraper crashed: {str(e)[:120]}")
+        send_text(f"Bexar scraper crashed: {str(e)[:120]}")
         raise
 
 
