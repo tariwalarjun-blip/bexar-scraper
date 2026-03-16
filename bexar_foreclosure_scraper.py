@@ -1,9 +1,9 @@
 """
-Bexar County Foreclosure Scraper - v4
-- Smart stop: stops when recorded date is OLDER THAN most recent date in sheet
-- Duplicate handling: updates existing row with new dates instead of adding new row
-- Address normalization: converts street suffixes to USPS abbreviations to match BatchLeads
-- Substitute trustee extraction via Claude API
+Bexar County Foreclosure Scraper - v5
+- Trustee extraction removed (was causing 6hr timeout)
+- Hard date limit: never goes back more than 30 days
+- Smart stop: stops when recorded date is older than most recent date in sheet
+- Duplicate handling: updates existing row instead of adding new row
 - Retry logic on page loads
 - Crash notification via SMS
 """
@@ -13,8 +13,7 @@ import re
 import time
 import logging
 import smtplib
-import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 
@@ -29,8 +28,10 @@ SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253e
 SHEET_TAB          = "Sheet1"
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 SMS_TO             = "7262412180@vtext.com"
+
+# Never scrape further back than this many days
+MAX_DAYS_BACK = 30
 
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
 
@@ -111,7 +112,6 @@ def goto_with_retry(page, url, retries=3, delay=5):
     return False
 
 def normalize_street(street):
-    """Normalize street suffix to USPS abbreviation to match BatchLeads format."""
     parts = street.upper().split()
     if parts and parts[-1] in SUFFIX_MAP:
         parts[-1] = SUFFIX_MAP[parts[-1]]
@@ -139,7 +139,6 @@ def get_existing_data(sheet):
         street = row[0].strip() if len(row) > 0 else ""
         if street:
             existing_addresses[street.upper()] = i
-
         if len(row) > 4 and row[4].strip():
             d = parse_date(row[4])
             if d:
@@ -158,68 +157,18 @@ def parse_address(full_address):
     state = state_map.get(state.strip(), state.strip())
     return normalize_street(street.strip()), city.strip(), state.strip(), zip_.strip()
 
-def append_row(sheet, address, recorded_date, sale_date, trustee=""):
+def append_row(sheet, address, recorded_date, sale_date):
     street, city, state, zip_ = parse_address(address)
     sheet.append_row(
-        [street, city, state, zip_, recorded_date, sale_date, trustee, "Active", ""],
+        [street, city, state, zip_, recorded_date, sale_date, "", "Active", ""],
         value_input_option="USER_ENTERED",
     )
-    log.info(f"  New row: {street} | {recorded_date} | trustee: {trustee or '—'}")
+    log.info(f"  New row: {street} | {recorded_date}")
 
 def update_row(sheet, row_index, recorded_date, sale_date):
     sheet.update_cell(row_index, 5, recorded_date)
     sheet.update_cell(row_index, 6, sale_date)
     log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
-
-
-# ─────────────────────────────────────────────
-# Trustee Extraction via Claude API
-# ─────────────────────────────────────────────
-
-def extract_trustee(page, doc_url):
-    if not ANTHROPIC_API_KEY:
-        return ""
-    try:
-        import anthropic
-        if not goto_with_retry(page, doc_url, retries=2, delay=3):
-            return ""
-        time.sleep(2)
-        screenshot = page.screenshot(full_page=True)
-        img_b64 = base64.standard_b64encode(screenshot).decode("utf-8")
-
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        response = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=100,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": img_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "This is a Texas foreclosure notice. "
-                            "Find and return ONLY the name of the Substitute Trustee. "
-                            "Return just the name with no extra text. "
-                            "If you cannot find it, return 'Unknown'."
-                        ),
-                    },
-                ],
-            }],
-        )
-        trustee = response.content[0].text.strip()
-        log.info(f"  Trustee: {trustee}")
-        return trustee
-    except Exception as e:
-        log.warning(f"  Trustee extraction failed: {e}")
-        return ""
 
 
 # ─────────────────────────────────────────────
@@ -229,6 +178,11 @@ def extract_trustee(page, doc_url):
 def scrape_foreclosures(most_recent_date):
     results = []
     done    = False
+
+    # Hard cutoff: never go back more than MAX_DAYS_BACK days
+    hard_cutoff = datetime.now() - timedelta(days=MAX_DAYS_BACK)
+    stop_date   = max(most_recent_date, hard_cutoff) if most_recent_date else hard_cutoff
+    log.info(f"Stop date: {stop_date.strftime('%m/%d/%Y')}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -264,15 +218,11 @@ def scrape_foreclosures(most_recent_date):
                     recorded_date = dates[0]
                     sale_date     = dates[1] if len(dates) >= 2 else ""
 
-                    if most_recent_date:
-                        rec_dt = parse_date(recorded_date)
-                        if rec_dt and rec_dt < most_recent_date:
-                            log.info(
-                                f"  {recorded_date} < most recent "
-                                f"{most_recent_date.strftime('%m/%d/%Y')} — stopping."
-                            )
-                            done = True
-                            break
+                    rec_dt = parse_date(recorded_date)
+                    if rec_dt and rec_dt < stop_date:
+                        log.info(f"  {recorded_date} < stop date {stop_date.strftime('%m/%d/%Y')} — stopping.")
+                        done = True
+                        break
 
                     address = ""
                     for val in reversed(cell_text):
@@ -280,24 +230,11 @@ def scrape_foreclosures(most_recent_date):
                             address = val
                             break
 
-                    doc_url = None
-                    try:
-                        href = row.locator("a").first.get_attribute("href")
-                        if href:
-                            doc_url = (
-                                f"https://bexar.tx.publicsearch.us{href}"
-                                if href.startswith("/") else href
-                            )
-                    except Exception:
-                        pass
-
                     if address:
                         results.append({
                             "address":       address,
                             "recorded_date": recorded_date,
                             "sale_date":     sale_date,
-                            "doc_url":       doc_url,
-                            "trustee":       "",
                         })
 
                 except Exception as e:
@@ -314,13 +251,6 @@ def scrape_foreclosures(most_recent_date):
             offset   += 50
             page_num += 1
 
-        if ANTHROPIC_API_KEY and results:
-            log.info(f"Extracting trustee names for {len(results)} record(s)…")
-            for f in results:
-                if f.get("doc_url"):
-                    f["trustee"] = extract_trustee(page, f["doc_url"])
-                    time.sleep(1)
-
         browser.close()
 
     return results
@@ -332,7 +262,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v4")
+    log.info("Bexar County Foreclosure Scraper v5")
     log.info("=" * 60)
 
     try:
@@ -361,13 +291,7 @@ def main():
                 update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
                 update_count += 1
             else:
-                append_row(
-                    sheet,
-                    f["address"],
-                    f["recorded_date"],
-                    f["sale_date"],
-                    f.get("trustee", ""),
-                )
+                append_row(sheet, f["address"], f["recorded_date"], f["sale_date"])
                 new_count += 1
 
             time.sleep(1.5)
