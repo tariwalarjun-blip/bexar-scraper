@@ -1,6 +1,6 @@
 """
 Bexar County Foreclosure Scraper - v3
-- Smart stop: stops when recorded date is older than most recent date in sheet
+- Smart stop: stops when recorded date is OLDER THAN most recent date in sheet
 - Duplicate handling: updates existing row with new dates instead of adding new row
 - Substitute trustee extraction via Claude API
 - Retry logic on page loads
@@ -220,9 +220,9 @@ def scrape_foreclosures(most_recent_date):
 
                     if most_recent_date:
                         rec_dt = parse_date(recorded_date)
-                        if rec_dt and rec_dt <= most_recent_date:
+                        if rec_dt and rec_dt < most_recent_date:
                             log.info(
-                                f"  {recorded_date} <= most recent "
+                                f"  {recorded_date} < most recent "
                                 f"{most_recent_date.strftime('%m/%d/%Y')} — stopping."
                             )
                             done = True
@@ -312,11 +312,9 @@ def main():
             row_index = existing_addresses.get(key)
 
             if row_index is not None:
-                # Address already existed in sheet before this run — update dates
                 update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
                 update_count += 1
             else:
-                # Brand new address — append new row
                 append_row(
                     sheet,
                     f["address"],
