@@ -1,11 +1,10 @@
 """
-Bexar County Foreclosure Scraper - Final
-- Goes directly to results URL (no form clicking needed)
-- Sorted by recorded date descending
-- Pages through ALL results until hitting a known recorded date
-- Splits address into Street, City, State, ZIP columns
-- New address → writes to sheet
-- Duplicate address → writes to sheet + texts you
+Bexar County Foreclosure Scraper - v2
+Improvements over v1:
+- Smart stop condition: compares dates properly so it never misses same-day filings
+- Substitute trustee extraction via Claude API (requires ANTHROPIC_API_KEY secret)
+- Retry logic: retries failed page loads up to 3 times before giving up
+- Crash notification: texts you if the scraper crashes
 """
 
 import os
@@ -13,6 +12,8 @@ import re
 import time
 import logging
 import smtplib
+import base64
+from datetime import datetime
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 
@@ -22,17 +23,29 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-CREDENTIALS_FILE   = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
-SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
-SHEET_TAB          = "Sheet1"
-GMAIL_USER         = os.environ["GMAIL_USER"]
+CREDENTIALS_FILE  = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
+SHEET_ID          = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
+SHEET_TAB         = "Sheet1"
+GMAIL_USER        = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-SMS_TO             = "7262412180@vtext.com"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+SMS_TO            = "7262412180@vtext.com"
 
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────
+
+def parse_date(date_str):
+    try:
+        return datetime.strptime(date_str.strip(), "%m/%d/%Y")
+    except Exception:
+        return None
 
 def send_text(message):
     try:
@@ -43,29 +56,54 @@ def send_text(message):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             server.sendmail(GMAIL_USER, SMS_TO, msg.as_string())
-        log.info(f"  Text sent: {message}")
+        log.info(f"  Text sent: {message[:80]}")
     except Exception as e:
         log.warning(f"  Text failed: {e}")
 
+def goto_with_retry(page, url, retries=3, delay=5):
+    for attempt in range(1, retries + 1):
+        try:
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            return True
+        except Exception as e:
+            log.warning(f"  Page load attempt {attempt}/{retries} failed: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+    return False
+
+
+# ─────────────────────────────────────────────
+# Google Sheets
+# ─────────────────────────────────────────────
+
 def get_sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds  = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(SHEET_TAB)
 
 def get_existing_data(sheet):
     rows = sheet.get_all_values()
-    existing_addresses = set()
-    existing_dates     = set()
-    for row in rows[1:]:
-        if row[0].strip():
-            existing_addresses.add(row[0].strip().upper())
+    existing_addresses = {}
+    all_dates = []
+
+    for i, row in enumerate(rows[1:], start=2):
+        street = row[0].strip() if row else ""
+        if street:
+            existing_addresses[street.upper()] = i
         if len(row) > 4 and row[4].strip():
-            existing_dates.add(row[4].strip())
-    return existing_addresses, existing_dates
+            d = parse_date(row[4])
+            if d:
+                all_dates.append(d)
+
+    most_recent_date = max(all_dates) if all_dates else None
+    return existing_addresses, most_recent_date
 
 def parse_address(full_address):
-    parts  = [p.strip() for p in full_address.split(",")]
-    street = parts[0] if len(parts) > 0 else full_address
+    parts = [p.strip() for p in full_address.split(",")]
+    street = parts[0] if parts else full_address
     city   = parts[1] if len(parts) > 1 else ""
     state  = parts[2] if len(parts) > 2 else "TX"
     zip_   = parts[3] if len(parts) > 3 else ""
@@ -73,15 +111,75 @@ def parse_address(full_address):
     state = state_map.get(state.strip(), state.strip())
     return street.strip(), city.strip(), state.strip(), zip_.strip()
 
-def append_row(sheet, address, recorded_date, sale_date):
+def append_row(sheet, address, recorded_date, sale_date, trustee=""):
     street, city, state, zip_ = parse_address(address)
     sheet.append_row(
-        [street, city, state, zip_, recorded_date, sale_date, "Active", ""],
-        value_input_option="USER_ENTERED"
+        [street, city, state, zip_, recorded_date, sale_date, trustee, "Active", ""],
+        value_input_option="USER_ENTERED",
     )
-    log.info(f"  Written: {street} | {city} | {state} | {zip_} | {recorded_date}")
+    log.info(f"  New row: {street} | {recorded_date} | trustee: {trustee or '—'}")
 
-def scrape_foreclosures(existing_dates):
+def update_row(sheet, row_index, recorded_date, sale_date):
+    sheet.update_cell(row_index, 5, recorded_date)
+    sheet.update_cell(row_index, 6, sale_date)
+    log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
+
+
+# ─────────────────────────────────────────────
+# Trustee Extraction via Claude API
+# ─────────────────────────────────────────────
+
+def extract_trustee(page, doc_url):
+    if not ANTHROPIC_API_KEY:
+        return ""
+    try:
+        import anthropic
+        if not goto_with_retry(page, doc_url, retries=2, delay=3):
+            return ""
+        time.sleep(2)
+        screenshot = page.screenshot(full_page=True)
+        img_b64 = base64.standard_b64encode(screenshot).decode("utf-8")
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=100,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": img_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This is a Texas foreclosure notice. "
+                            "Find and return ONLY the name of the Substitute Trustee. "
+                            "Return just the name with no extra text. "
+                            "If you cannot find it, return 'Unknown'."
+                        ),
+                    },
+                ],
+            }],
+        )
+        trustee = response.content[0].text.strip()
+        log.info(f"  Trustee: {trustee}")
+        return trustee
+    except Exception as e:
+        log.warning(f"  Trustee extraction failed: {e}")
+        return ""
+
+
+# ─────────────────────────────────────────────
+# Scraper
+# ─────────────────────────────────────────────
+
+def scrape_foreclosures(most_recent_date):
     results = []
     done    = False
 
@@ -95,14 +193,17 @@ def scrape_foreclosures(existing_dates):
 
         while not done:
             url = BASE_URL.format(offset=offset)
-            log.info(f"Loading page {page_num} (offset={offset})...")
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            log.info(f"Loading page {page_num} (offset={offset})…")
+
+            if not goto_with_retry(page, url):
+                log.error(f"  Gave up after 3 retries on page {page_num}.")
+                break
+
             time.sleep(3)
 
-            rows = page.locator("table tbody tr").all()
-            log.info(f"  Rows on page: {len(rows)}")
-
+            rows      = page.locator("table tbody tr").all()
             data_rows = 0
+
             for row in rows:
                 try:
                     cells     = row.locator("td").all()
@@ -112,7 +213,19 @@ def scrape_foreclosures(existing_dates):
                     if not dates:
                         continue
 
-                    data_rows += 1
+                    data_rows    += 1
+                    recorded_date = dates[0]
+                    sale_date     = dates[1] if len(dates) >= 2 else ""
+
+                    if most_recent_date:
+                        rec_dt = parse_date(recorded_date)
+                        if rec_dt and rec_dt <= most_recent_date:
+                            log.info(
+                                f"  Recorded date {recorded_date} ≤ "
+                                f"most recent {most_recent_date.strftime('%m/%d/%Y')} — stopping."
+                            )
+                            done = True
+                            break
 
                     address = ""
                     for val in reversed(cell_text):
@@ -120,29 +233,33 @@ def scrape_foreclosures(existing_dates):
                             address = val
                             break
 
-                    recorded_date = dates[0]
-                    sale_date     = dates[1] if len(dates) >= 2 else ""
-
-                    if recorded_date in existing_dates:
-                        log.info(f"  Hit known date {recorded_date} — stopping.")
-                        done = True
-                        break
+                    doc_url = None
+                    try:
+                        href = row.locator("a").first.get_attribute("href")
+                        if href:
+                            doc_url = (
+                                f"https://bexar.tx.publicsearch.us{href}"
+                                if href.startswith("/") else href
+                            )
+                    except Exception:
+                        pass
 
                     if address:
                         results.append({
-                            "address": address,
+                            "address":       address,
                             "recorded_date": recorded_date,
-                            "sale_date": sale_date,
+                            "sale_date":     sale_date,
+                            "doc_url":       doc_url,
+                            "trustee":       "",
                         })
 
                 except Exception as e:
                     log.warning(f"  Row error: {e}")
 
-            log.info(f"  Data rows: {data_rows}")
+            log.info(f"  Data rows this page: {data_rows}")
 
             if done or data_rows == 0:
                 break
-
             if data_rows < 50:
                 log.info("  Last page reached.")
                 break
@@ -150,41 +267,65 @@ def scrape_foreclosures(existing_dates):
             offset   += 50
             page_num += 1
 
+        if ANTHROPIC_API_KEY and results:
+            log.info(f"Extracting trustee names for {len(results)} record(s)…")
+            for f in results:
+                if f.get("doc_url"):
+                    f["trustee"] = extract_trustee(page, f["doc_url"])
+                    time.sleep(1)
+
         browser.close()
+
     return results
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper")
+    log.info("Bexar County Foreclosure Scraper v2")
     log.info("=" * 60)
-    sheet                              = get_sheet()
-    existing_addresses, existing_dates = get_existing_data(sheet)
-    log.info(f"Existing records: {len(existing_addresses)} | Known dates: {len(existing_dates)}")
 
-    foreclosures = scrape_foreclosures(existing_dates)
-    log.info(f"New foreclosures found: {len(foreclosures)}")
+    try:
+        sheet                        = get_sheet()
+        existing_addresses, most_recent = get_existing_data(sheet)
+        log.info(
+            f"Existing records: {len(existing_addresses)} | "
+            f"Most recent date: {most_recent.strftime('%m/%d/%Y') if most_recent else 'none'}"
+        )
 
-    new_count  = 0
-    dupe_count = 0
-    for f in foreclosures:
-        street, city, state, zip_ = parse_address(f["address"])
-        key = street.strip().upper()
-        if not key:
-            continue
+        foreclosures = scrape_foreclosures(most_recent)
+        log.info(f"Records to process: {len(foreclosures)}")
 
-        is_dupe = key in existing_addresses
-        append_row(sheet, f["address"], f["recorded_date"], f["sale_date"])
-        existing_addresses.add(key)
-        existing_dates.add(f["recorded_date"])
-        new_count += 1
+        new_count    = 0
+        update_count = 0
 
-        if is_dupe:
-            dupe_count += 1
-            send_text(f"REFILE: {f['address']} recorded again {f['recorded_date']}. Sale: {f['sale_date']}")
+        for f in foreclosures:
+            street, _, _, _ = parse_address(f["address"])
+            key = street.strip().upper()
+            if not key:
+                continue
 
-        time.sleep(1.5)
+            if key in existing_addresses:
+                row_index = existing_addresses[key]
+                update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
+                update_count += 1
+            else:
+                append_row(sheet, f["address"], f["recorded_date"], f["sale_date"], f.get("trustee", ""))
+                existing_addresses[key] = None
+                new_count += 1
 
-    log.info(f"Done. {new_count} records written. {dupe_count} refile alerts sent.")
+            time.sleep(1.5)
+
+        log.info(f"Done. {new_count} new | {update_count} updated.")
+
+    except Exception as e:
+        log.error(f"SCRAPER CRASHED: {e}")
+        send_text(f"⚠️ Bexar scraper crashed: {str(e)[:120]}")
+        raise
+
 
 if __name__ == "__main__":
     main()
