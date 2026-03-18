@@ -1,6 +1,8 @@
 """
-Bexar County Foreclosure Scraper - v8
+Bexar County Foreclosure Scraper - v9
 - Writes to DateLookup tab (Address, recorded date, sale date) for reliable Zap lookup
+- DateLookup addresses stored WITHOUT street suffix (e.g. "7407 BLUESTONE" not "7407 BLUESTONE RD")
+  so they match BatchLeads format for Zapier lookup
 - Pings Zapier webhook for instant BatchLeads trigger
 - Smart stop, duplicate handling, address normalization, retry logic, crash SMS
 - 3 second sleep between writes to avoid Google Sheets rate limit
@@ -77,6 +79,8 @@ SUFFIX_MAP = {
     "WELLS": "WLS",
 }
 
+ALL_SUFFIXES = set(SUFFIX_MAP.keys()) | set(SUFFIX_MAP.values())
+
 
 # ─────────────────────────────────────────────
 # Utilities
@@ -134,9 +138,21 @@ def goto_with_retry(page, url, retries=3, delay=5):
     return False
 
 def normalize_street(street):
+    """Normalize street for Sheet1 — maps long suffix to abbreviation (e.g. ROAD → RD)."""
     parts = street.upper().split()
     if parts and parts[-1] in SUFFIX_MAP:
         parts[-1] = SUFFIX_MAP[parts[-1]]
+    return " ".join(parts)
+
+def normalize_lookup_address(street):
+    """
+    Strip street suffix entirely for DateLookup.
+    BatchLeads often drops the suffix (e.g. sends '7407 BLUESTONE' not '7407 BLUESTONE RD').
+    Storing without suffix ensures the Zapier lookup matches.
+    """
+    parts = street.upper().split()
+    if parts and parts[-1].rstrip('.') in ALL_SUFFIXES:
+        parts = parts[:-1]
     return " ".join(parts)
 
 
@@ -171,11 +187,13 @@ def get_existing_data(sheet):
     return existing_addresses, most_recent_date
 
 def get_lookup_addresses(lookup_sheet):
+    """Load DateLookup addresses — keyed by suffix-stripped uppercase address."""
     rows = lookup_sheet.get_all_values()
     lookup = {}
     for i, row in enumerate(rows[1:], start=2):
         if row and row[0].strip():
-            lookup[row[0].strip().upper()] = i
+            key = normalize_lookup_address(row[0].strip())
+            lookup[key] = i
     return lookup
 
 def parse_address(full_address):
@@ -198,15 +216,15 @@ def append_row(sheet, lookup_sheet, lookup_addresses, address, recorded_date, sa
     log.info(f"  New row: {street} | {recorded_date}")
     time.sleep(2)
 
-    key = street.upper()
-    if key in lookup_addresses:
-        row_idx = lookup_addresses[key]
+    lookup_key = normalize_lookup_address(street)
+    if lookup_key in lookup_addresses:
+        row_idx = lookup_addresses[lookup_key]
         lookup_sheet.update_cell(row_idx, 2, recorded_date)
         time.sleep(2)
         lookup_sheet.update_cell(row_idx, 3, sale_date)
     else:
         lookup_sheet.append_row(
-            [street, recorded_date, sale_date],
+            [lookup_key, recorded_date, sale_date],
             value_input_option="USER_ENTERED",
         )
     time.sleep(2)
@@ -221,15 +239,15 @@ def update_row(sheet, lookup_sheet, lookup_addresses, row_index, address, record
     log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
 
     street, _, _, _ = parse_address(address)
-    key = street.upper()
-    if key in lookup_addresses:
-        row_idx = lookup_addresses[key]
+    lookup_key = normalize_lookup_address(street)
+    if lookup_key in lookup_addresses:
+        row_idx = lookup_addresses[lookup_key]
         lookup_sheet.update_cell(row_idx, 2, recorded_date)
         time.sleep(2)
         lookup_sheet.update_cell(row_idx, 3, sale_date)
     else:
         lookup_sheet.append_row(
-            [street, recorded_date, sale_date],
+            [lookup_key, recorded_date, sale_date],
             value_input_option="USER_ENTERED",
         )
     time.sleep(2)
@@ -336,7 +354,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v8")
+    log.info("Bexar County Foreclosure Scraper v9")
     log.info("=" * 60)
 
     try:
