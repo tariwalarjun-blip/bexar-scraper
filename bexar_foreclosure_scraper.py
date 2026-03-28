@@ -1,11 +1,13 @@
 """
-Bexar County Foreclosure Scraper - v9
+Bexar County Foreclosure Scraper - v10
 - Writes to DateLookup tab (Address, recorded date, sale date) for reliable Zap lookup
 - DateLookup addresses stored WITHOUT street suffix (e.g. "7407 BLUESTONE" not "7407 BLUESTONE RD")
   so they match BatchLeads format for Zapier lookup
 - Pings Zapier webhook for instant BatchLeads trigger
 - Smart stop, duplicate handling, address normalization, retry logic, crash SMS
 - 3 second sleep between writes to avoid Google Sheets rate limit
+- v10: Extracts substitute trustee from each property detail page (direct URL nav, no click/back)
+       Trustee written to Sheet1 column J (col 10)
 """
 
 import os
@@ -34,7 +36,8 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 SMS_TO             = "7262412180@vtext.com"
 ZAPIER_WEBHOOK_URL = "https://hooks.zapier.com/hooks/catch/26182087/upy4s7l/"
 
-MAX_DAYS_BACK = 30
+MAX_DAYS_BACK  = 30
+DETAIL_BASE    = "https://bexar.tx.publicsearch.us"
 
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
 
@@ -138,22 +141,88 @@ def goto_with_retry(page, url, retries=3, delay=5):
     return False
 
 def normalize_street(street):
-    """Normalize street for Sheet1 — maps long suffix to abbreviation (e.g. ROAD → RD)."""
     parts = street.upper().split()
     if parts and parts[-1] in SUFFIX_MAP:
         parts[-1] = SUFFIX_MAP[parts[-1]]
     return " ".join(parts)
 
 def normalize_lookup_address(street):
-    """
-    Strip street suffix entirely for DateLookup.
-    BatchLeads often drops the suffix (e.g. sends '7407 BLUESTONE' not '7407 BLUESTONE RD').
-    Storing without suffix ensures the Zapier lookup matches.
-    """
     parts = street.upper().split()
     if parts and parts[-1].rstrip('.') in ALL_SUFFIXES:
         parts = parts[:-1]
     return " ".join(parts)
+
+
+# ─────────────────────────────────────────────
+# Substitute Trustee Extraction
+# ─────────────────────────────────────────────
+
+def get_substitute_trustee(page, detail_url, results_url):
+    """
+    Navigate to the property detail page, extract the substitute trustee name,
+    then navigate back to the results page.
+
+    Tries two strategies:
+      1. Find a label element containing "trustee" and grab the adjacent value element.
+      2. Regex scan of full page text for the trustee name after the label.
+
+    Returns trustee name (uppercased) or "" if not found.
+    """
+    trustee = ""
+    try:
+        if not goto_with_retry(page, detail_url):
+            log.warning(f"  Could not load detail page: {detail_url}")
+            return ""
+        time.sleep(1)
+
+        # ── Strategy 1: DOM label/value pair ──
+        # The Bexar detail page renders fields as adjacent spans or dt/dd pairs.
+        # Try to find any element whose text contains "trustee" (case-insensitive)
+        # and grab its next sibling's text.
+        trustee_label = page.locator(
+            "xpath=//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'trustee')]"
+        ).first
+        if trustee_label.count() > 0:
+            # Try next sibling element
+            sibling = trustee_label.locator("xpath=following-sibling::*[1]")
+            if sibling.count() > 0:
+                candidate = sibling.inner_text().strip()
+                # Sanity check: reject if it looks like a label itself or is empty
+                if candidate and len(candidate) > 2 and "trustee" not in candidate.lower():
+                    trustee = candidate.upper()
+                    log.info(f"  Trustee (DOM): {trustee}")
+
+        # ── Strategy 2: Regex scan of full page text ──
+        if not trustee:
+            body = page.inner_text("body")
+            # Match: "Substitute Trustee" (or "Sub Trustee" or "Trustee") followed by
+            # optional whitespace/punctuation then the trustee name on the same or next line
+            match = re.search(
+                r"(?:substitute\s+trustee|sub\s+trustee|trustee)\s*[:\-\n\r]?\s*([A-Z][A-Z\s,\.&]+?)(?:\n|\r|$)",
+                body,
+                re.IGNORECASE,
+            )
+            if match:
+                candidate = match.group(1).strip()
+                if candidate and len(candidate) > 2:
+                    trustee = candidate.upper()
+                    log.info(f"  Trustee (regex): {trustee}")
+
+        if not trustee:
+            log.info("  Trustee: not found on detail page")
+
+    except Exception as e:
+        log.warning(f"  Trustee extraction error: {e}")
+
+    finally:
+        # Always navigate back to the results page
+        try:
+            goto_with_retry(page, results_url)
+            time.sleep(2)
+        except Exception as e:
+            log.warning(f"  Failed to navigate back to results: {e}")
+
+    return trustee
 
 
 # ─────────────────────────────────────────────
@@ -187,7 +256,6 @@ def get_existing_data(sheet):
     return existing_addresses, most_recent_date
 
 def get_lookup_addresses(lookup_sheet):
-    """Load DateLookup addresses — keyed by suffix-stripped uppercase address."""
     rows = lookup_sheet.get_all_values()
     lookup = {}
     for i, row in enumerate(rows[1:], start=2):
@@ -206,14 +274,15 @@ def parse_address(full_address):
     state = state_map.get(state.strip(), state.strip())
     return normalize_street(street.strip()), city.strip(), state.strip(), zip_.strip()
 
-def append_row(sheet, lookup_sheet, lookup_addresses, address, recorded_date, sale_date):
+def append_row(sheet, lookup_sheet, lookup_addresses, address, recorded_date, sale_date, trustee=""):
     street, city, state, zip_ = parse_address(address)
 
+    # Col:  A       B     C      D     E              F          G   H         I   J
     sheet.append_row(
-        [street, city, state, zip_, recorded_date, sale_date, "", "Active", ""],
+        [street, city, state, zip_, recorded_date, sale_date, "", "Active", "", trustee],
         value_input_option="USER_ENTERED",
     )
-    log.info(f"  New row: {street} | {recorded_date}")
+    log.info(f"  New row: {street} | {recorded_date} | trustee={trustee or 'N/A'}")
     time.sleep(2)
 
     lookup_key = normalize_lookup_address(street)
@@ -231,12 +300,15 @@ def append_row(sheet, lookup_sheet, lookup_addresses, address, recorded_date, sa
 
     ping_zapier(street, city, state, zip_, recorded_date, sale_date)
 
-def update_row(sheet, lookup_sheet, lookup_addresses, row_index, address, recorded_date, sale_date):
+def update_row(sheet, lookup_sheet, lookup_addresses, row_index, address, recorded_date, sale_date, trustee=""):
     sheet.update_cell(row_index, 5, recorded_date)
     time.sleep(2)
     sheet.update_cell(row_index, 6, sale_date)
     time.sleep(2)
-    log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
+    if trustee:
+        sheet.update_cell(row_index, 10, trustee)   # col J
+        time.sleep(2)
+    log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date} | trustee={trustee or 'N/A'}")
 
     street, _, _, _ = parse_address(address)
     lookup_key = normalize_lookup_address(street)
@@ -271,6 +343,20 @@ def scrape_page_with_retry(page, url, max_retries=3):
     log.error("  Page returned 0 rows after all retries.")
     return []
 
+def get_row_detail_url(row):
+    """Extract the href from the first <a> tag in a results table row."""
+    try:
+        link = row.locator("a").first
+        if link.count() > 0:
+            href = link.get_attribute("href")
+            if href:
+                if href.startswith("http"):
+                    return href
+                return DETAIL_BASE + href
+    except Exception:
+        pass
+    return ""
+
 def scrape_foreclosures(most_recent_date):
     results = []
     done    = False
@@ -288,14 +374,16 @@ def scrape_foreclosures(most_recent_date):
         page_num = 1
 
         while not done:
-            url = BASE_URL.format(offset=offset)
+            results_url = BASE_URL.format(offset=offset)
             log.info(f"Loading page {page_num} (offset={offset})…")
 
-            rows = scrape_page_with_retry(page, url)
+            rows = scrape_page_with_retry(page, results_url)
             if not rows:
                 log.error(f"  Giving up on page {page_num} after retries.")
                 break
 
+            # Collect all row data + detail URLs before navigating away
+            page_records = []
             data_rows = 0
             for row in rows:
                 try:
@@ -322,17 +410,30 @@ def scrape_foreclosures(most_recent_date):
                             address = val
                             break
 
+                    detail_url = get_row_detail_url(row)
+
                     if address:
-                        results.append({
+                        page_records.append({
                             "address":       address,
                             "recorded_date": recorded_date,
                             "sale_date":     sale_date,
+                            "detail_url":    detail_url,
                         })
 
                 except Exception as e:
                     log.warning(f"  Row error: {e}")
 
             log.info(f"  Data rows this page: {data_rows}")
+
+            # Now visit each detail page to get trustee
+            for rec in page_records:
+                trustee = ""
+                if rec["detail_url"]:
+                    trustee = get_substitute_trustee(page, rec["detail_url"], results_url)
+                    # After returning, reload results page for next iteration
+                    # (get_substitute_trustee already navigates back)
+                rec["trustee"] = trustee
+                results.append(rec)
 
             if done or data_rows == 0:
                 break
@@ -354,7 +455,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v9")
+    log.info("Bexar County Foreclosure Scraper v10")
     log.info("=" * 60)
 
     try:
@@ -379,12 +480,13 @@ def main():
                 continue
 
             row_index = existing_addresses.get(key)
+            trustee   = f.get("trustee", "")
 
             if row_index is not None:
-                update_row(sheet, lookup_sheet, lookup_addresses, row_index, f["address"], f["recorded_date"], f["sale_date"])
+                update_row(sheet, lookup_sheet, lookup_addresses, row_index, f["address"], f["recorded_date"], f["sale_date"], trustee)
                 update_count += 1
             else:
-                append_row(sheet, lookup_sheet, lookup_addresses, f["address"], f["recorded_date"], f["sale_date"])
+                append_row(sheet, lookup_sheet, lookup_addresses, f["address"], f["recorded_date"], f["sale_date"], trustee)
                 new_count += 1
 
             time.sleep(3)
