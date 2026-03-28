@@ -148,9 +148,7 @@ def get_substitute_trustee(page, doc_number, results_url):
 
         # Strategy 1: look for "SUBSTITUTE TRUSTEE" pattern in document text
         match = re.search(
-            r'SUBSTITUTE TRUSTEE[S)(\s]*[:\-]?\s*
-?\s*([A-Za-z][A-Za-z0-9\s,\.\&]+?)(?:
-|Attorney|LLC|PC|PLLC|LLP|Corp|Inc)',
+            r'SUBSTITUTE TRUSTEE[S)(\s]*[:\-]?\s*\n?\s*([A-Za-z][A-Za-z0-9\s,\.\&]+?)(?:\n|Attorney|LLC|PC|PLLC|LLP|Corp|Inc)',
             body, re.IGNORECASE
         )
         if match:
