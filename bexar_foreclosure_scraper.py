@@ -1,9 +1,10 @@
 """
-Bexar County Foreclosure Scraper - v10
-- Smart stop, duplicate handling, address normalization, retry logic, crash SMS
-- 3 second sleep between writes to avoid Google Sheets rate limit
-- v10: Extracts substitute trustee from each property detail page (direct URL nav, no click/back)
-       Trustee written to Sheet1 column J (col 10)
+Bexar County Foreclosure Scraper - v11
+- All v10 features retained
+- NEW: Fires Zapier webhook directly for new records → REsimpli (no more Sheet-triggered Zap)
+- NEW: Refiling SMS alert for existing addresses with new dates
+- NEW: Webhook retry logic (3 attempts) so no leads are silently dropped
+- Google Sheet kept as duplicate check memory and backup log
 """
 
 import os
@@ -13,6 +14,7 @@ import logging
 import smtplib
 import json
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
@@ -28,9 +30,10 @@ SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253e
 SHEET_TAB          = "Sheet1"
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")   # Add to GitHub secrets
 SMS_TO             = "7262412180@vtext.com"
-MAX_DAYS_BACK  = 30
-DETAIL_BASE    = "https://bexar.tx.publicsearch.us"
+MAX_DAYS_BACK      = 30
+DETAIL_BASE        = "https://bexar.tx.publicsearch.us"
 
 # Known substitute trustee companies operating in Bexar County
 KNOWN_TRUSTEES = [
@@ -81,8 +84,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(me
 log = logging.getLogger(__name__)
 
 
-
-
 # ─────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────
@@ -92,6 +93,7 @@ def parse_date(date_str):
         return datetime.strptime(date_str.strip(), "%m/%d/%Y")
     except Exception:
         return None
+
 
 def send_text(message):
     try:
@@ -107,6 +109,56 @@ def send_text(message):
         log.warning(f"  Text failed: {e}")
 
 
+def fire_zapier_webhook(address, recorded_date, sale_date, trustee="", retries=3, delay=5):
+    """
+    POST new lead data directly to Zapier webhook → REsimpli.
+    Only called for NEW records (not refilings).
+    Retries up to 3 times on failure so no lead is silently dropped.
+    """
+    if not ZAPIER_WEBHOOK_URL:
+        log.warning("  ZAPIER_WEBHOOK_URL not set — skipping webhook fire.")
+        return False
+
+    street, city, state, zip_ = parse_address(address)
+    full_address = f"{street}, {city}, {state} {zip_}".strip(", ")
+
+    payload = json.dumps({
+        "address":       full_address,
+        "street":        street,
+        "city":          city,
+        "state":         state,
+        "zip":           zip_,
+        "recorded_date": recorded_date,
+        "sale_date":     sale_date,
+        "trustee":       trustee,
+        "lead_source":   "Foreclosure Auction",
+    }).encode("utf-8")
+
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                ZAPIER_WEBHOOK_URL,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status = resp.getcode()
+                if status == 200:
+                    log.info(f"  Webhook fired OK: {street}")
+                    return True
+                else:
+                    log.warning(f"  Webhook attempt {attempt} returned status {status}")
+        except urllib.error.URLError as e:
+            log.warning(f"  Webhook attempt {attempt}/{retries} failed: {e}")
+        if attempt < retries:
+            time.sleep(delay)
+
+    # All retries failed — send SMS so you know a lead was missed
+    send_text(f"⚠️ Webhook failed after {retries} attempts for: {street} | {recorded_date}")
+    return False
+
+
 def goto_with_retry(page, url, retries=3, delay=5):
     for attempt in range(1, retries + 1):
         try:
@@ -120,19 +172,14 @@ def goto_with_retry(page, url, retries=3, delay=5):
 
 
 def match_known_trustee(text):
-    """Try to match text against the known trustee list."""
     text_lower = text.lower()
     for trustee in KNOWN_TRUSTEES:
         if trustee in text_lower:
             return trustee.title()
     return ""
 
+
 def get_substitute_trustee(page, doc_number, results_url):
-    """
-    Navigate to the document detail page using the doc number,
-    extract the substitute trustee from the document text.
-    Returns trustee name or "" if not found.
-    """
     trustee = ""
     detail_url = f"{DETAIL_BASE}/doc/{doc_number}"
     try:
@@ -142,11 +189,9 @@ def get_substitute_trustee(page, doc_number, results_url):
             return ""
         time.sleep(3)
 
-        # Get full page text - document viewer renders text in the DOM
         body = page.inner_text("body")
         log.info(f"  Detail preview: {body[:300].replace(chr(10), ' | ')}")
 
-        # Strategy 1: look for "SUBSTITUTE TRUSTEE" pattern in document text
         match = re.search(
             r'SUBSTITUTE TRUSTEE[S)(\s]*[:\-]?\s*\n?\s*([A-Za-z][A-Za-z0-9\s,\.\&]+?)(?:\n|Attorney|LLC|PC|PLLC|LLP|Corp|Inc)',
             body, re.IGNORECASE
@@ -157,7 +202,6 @@ def get_substitute_trustee(page, doc_number, results_url):
                 trustee = candidate
                 log.info(f"  Trustee (pattern): {trustee}")
 
-        # Strategy 2: match against known trustee list
         if not trustee:
             trustee = match_known_trustee(body)
             if trustee:
@@ -191,6 +235,7 @@ def get_sheets():
     wb = gspread.authorize(creds).open_by_key(SHEET_ID)
     return wb.worksheet(SHEET_TAB)
 
+
 def get_existing_data(sheet):
     rows = sheet.get_all_values()
     existing_addresses = {}
@@ -219,15 +264,16 @@ def parse_address(full_address):
     state = state_map.get(state.strip(), state.strip())
     return street.strip().upper(), city.strip(), state.strip(), zip_.strip()
 
+
 def append_row(sheet, address, recorded_date, sale_date, trustee=""):
     street, city, state, zip_ = parse_address(address)
-    # Col:  A       B     C      D     E              F          G   H         I   J
     sheet.append_row(
         [street, city, state, zip_, recorded_date, sale_date, "", "Active", "", trustee],
         value_input_option="USER_ENTERED",
     )
     log.info(f"  New row: {street} | {recorded_date} | trustee={trustee or 'N/A'}")
     time.sleep(2)
+
 
 def update_row(sheet, row_index, address, recorded_date, sale_date, trustee=""):
     sheet.update_cell(row_index, 5, recorded_date)
@@ -284,7 +330,6 @@ def scrape_foreclosures(most_recent_date):
                 log.error(f"  Giving up on page {page_num} after retries.")
                 break
 
-            # Collect all row data + detail URLs before navigating away
             page_records = []
             data_rows = 0
             for row in rows:
@@ -312,7 +357,6 @@ def scrape_foreclosures(most_recent_date):
                             address = val
                             break
 
-                    # Doc number is a long numeric string in the row cells
                     doc_number = ""
                     for val in cell_text:
                         if re.match(r"^\d{10,}$", val.strip()):
@@ -332,7 +376,6 @@ def scrape_foreclosures(most_recent_date):
 
             log.info(f"  Data rows this page: {data_rows}")
 
-            # Now visit each detail page to get trustee
             for rec in page_records:
                 trustee = ""
                 if rec.get("doc_number"):
@@ -360,7 +403,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v10")
+    log.info("Bexar County Foreclosure Scraper v11")
     log.info("=" * 60)
 
     try:
@@ -374,8 +417,9 @@ def main():
         foreclosures = scrape_foreclosures(most_recent)
         log.info(f"Records to process: {len(foreclosures)}")
 
-        new_count    = 0
-        update_count = 0
+        new_count      = 0
+        update_count   = 0
+        webhook_failed = 0
 
         for f in foreclosures:
             street, _, _, _ = parse_address(f["address"])
@@ -387,18 +431,37 @@ def main():
             trustee   = f.get("trustee", "")
 
             if row_index is not None:
+                # REFILING — update sheet dates, send SMS alert, do NOT create new REsimpli lead
                 update_row(sheet, row_index, f["address"], f["recorded_date"], f["sale_date"], trustee)
                 update_count += 1
+                send_text(
+                    f"⚠️ Dead lead refiled: {street} | "
+                    f"Recorded: {f['recorded_date']} | "
+                    f"Auction: {f['sale_date']} | "
+                    f"Trustee: {trustee or 'unknown'}"
+                )
             else:
+                # NEW LEAD — write to sheet + fire webhook to REsimpli
                 append_row(sheet, f["address"], f["recorded_date"], f["sale_date"], trustee)
                 new_count += 1
+                success = fire_zapier_webhook(
+                    f["address"], f["recorded_date"], f["sale_date"], trustee
+                )
+                if not success:
+                    webhook_failed += 1
 
             time.sleep(3)
 
+        # Summary SMS
         if new_count == 0 and update_count == 0:
             send_text("⚠️ Bexar scraper ran but found 0 records. Check county site manually.")
+        elif new_count > 0 or update_count > 0:
+            summary = f"✅ Bexar scraper done. {new_count} new leads → REsimpli | {update_count} refilings"
+            if webhook_failed > 0:
+                summary += f" | ⚠️ {webhook_failed} webhook(s) failed"
+            send_text(summary)
 
-        log.info(f"Done. {new_count} new | {update_count} updated.")
+        log.info(f"Done. {new_count} new | {update_count} updated | {webhook_failed} webhook failures.")
 
     except Exception as e:
         log.error(f"SCRAPER CRASHED: {e}")
