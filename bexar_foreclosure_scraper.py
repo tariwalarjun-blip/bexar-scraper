@@ -1,10 +1,10 @@
 """
-Bexar County Foreclosure Scraper - v11
+Bexar County Foreclosure Scraper - v12
 - Fires Zapier webhook directly for new records → REsimpli
+- After webhook, calls REsimpli API to fetch lead ID and writes it to sheet column J
 - Refiling SMS alert for existing addresses with new dates
 - Webhook retry logic (3 attempts) so no leads are silently dropped
 - Google Sheet kept as duplicate check memory and backup log
-- Trustee extraction removed
 """
 
 import os
@@ -30,9 +30,12 @@ SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253e
 SHEET_TAB          = "Sheet1"
 GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")  # Add to GitHub secrets
+ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")
+RESIMPLI_API_KEY   = os.environ.get("RESIMPLI_API_KEY", "")
 SMS_TO             = "7262412180@vtext.com"
 MAX_DAYS_BACK      = 30
+
+RESIMPLI_API_BASE  = "https://app.resimpli.com/api/v1"
 
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
 
@@ -77,11 +80,6 @@ def parse_address(full_address):
 
 
 def fire_zapier_webhook(address, recorded_date, sale_date, retries=3, delay=5):
-    """
-    POST new lead data directly to Zapier webhook → REsimpli.
-    Only called for NEW records (not refilings).
-    Retries up to 3 times on failure so no lead is silently dropped.
-    """
     if not ZAPIER_WEBHOOK_URL:
         log.warning("  ZAPIER_WEBHOOK_URL not set — skipping webhook fire.")
         return False
@@ -122,6 +120,49 @@ def fire_zapier_webhook(address, recorded_date, sale_date, retries=3, delay=5):
 
     send_text(f"⚠️ Webhook failed after {retries} attempts for: {street} | {recorded_date}")
     return False
+
+
+def get_resimpli_lead_id(street, retries=3, delay=5):
+    """
+    Search REsimpli API for a lead by street address.
+    Returns the lead ID string if found, None otherwise.
+    """
+    if not RESIMPLI_API_KEY:
+        log.warning("  RESIMPLI_API_KEY not set — skipping ID lookup.")
+        return None
+
+    search_term = urllib.parse.quote(street)
+    url = f"{RESIMPLI_API_BASE}/leads?search={search_term}"
+
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"Bearer {RESIMPLI_API_KEY}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                # REsimpli returns leads in a 'data' or 'leads' array
+                leads = data.get("data") or data.get("leads") or []
+                if leads:
+                    lead_id = leads[0].get("id") or leads[0].get("_id")
+                    if lead_id:
+                        log.info(f"  REsimpli ID found: {lead_id} for {street}")
+                        return str(lead_id)
+                log.warning(f"  No lead found in REsimpli for: {street}")
+                return None
+        except urllib.error.URLError as e:
+            log.warning(f"  REsimpli API attempt {attempt}/{retries} failed: {e}")
+        if attempt < retries:
+            time.sleep(delay)
+
+    log.warning(f"  REsimpli ID lookup failed after {retries} attempts for: {street}")
+    return None
 
 
 def goto_with_retry(page, url, retries=3, delay=5):
@@ -184,6 +225,13 @@ def update_row(sheet, row_index, recorded_date, sale_date):
     sheet.update_cell(row_index, 6, sale_date)
     time.sleep(2)
     log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
+
+
+def write_resimpli_id(sheet, row_index, lead_id):
+    """Write REsimpli lead ID to column J (index 10)."""
+    sheet.update_cell(row_index, 10, lead_id)
+    time.sleep(1)
+    log.info(f"  Wrote REsimpli ID {lead_id} to row {row_index}")
 
 
 # ─────────────────────────────────────────────
@@ -288,8 +336,11 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v11")
+    log.info("Bexar County Foreclosure Scraper v12")
     log.info("=" * 60)
+
+    # Add urllib.parse import at top level
+    import urllib.parse
 
     try:
         sheet = get_sheets()
@@ -327,9 +378,19 @@ def main():
                 # NEW LEAD — write to sheet + fire webhook to REsimpli
                 append_row(sheet, f["address"], f["recorded_date"], f["sale_date"])
                 new_count += 1
+
+                # Get the row index we just wrote
+                new_row_index = len(existing_addresses) + new_count + 1
+
                 success = fire_zapier_webhook(f["address"], f["recorded_date"], f["sale_date"])
                 if not success:
                     webhook_failed += 1
+                else:
+                    # Wait for REsimpli to process the lead, then fetch its ID
+                    time.sleep(5)
+                    lead_id = get_resimpli_lead_id(street)
+                    if lead_id:
+                        write_resimpli_id(sheet, new_row_index, lead_id)
 
             time.sleep(3)
 
