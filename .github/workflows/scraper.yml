@@ -35,4 +35,5 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ZAPIER_WEBHOOK_URL: ${{ secrets.ZAPIER_WEBHOOK_URL }}
         run: python bexar_foreclosure_scraper.py
