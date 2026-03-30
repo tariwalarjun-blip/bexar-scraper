@@ -1,34 +1,27 @@
 name: Bexar Foreclosure Scraper
-
 on:
   schedule:
     - cron: '0 13 * * *'
   workflow_dispatch:
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
           playwright install chromium
           playwright install-deps chromium
-
       - name: Write credentials file
         env:
           CREDS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: python3 -c "import os,base64; open('service_account.json','wb').write(base64.b64decode(os.environ['CREDS_JSON']))"
-
       - name: Run scraper
         env:
           GOOGLE_SHEETS_CREDENTIALS: service_account.json
@@ -36,4 +29,5 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ZAPIER_WEBHOOK_URL: ${{ secrets.ZAPIER_WEBHOOK_URL }}
+          RESIMPLI_API_KEY: ${{ secrets.RESIMPLI_API_KEY }}
         run: python bexar_foreclosure_scraper.py
