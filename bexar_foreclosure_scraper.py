@@ -272,54 +272,30 @@ def cad_lookup(page, street):
                 # Table columns: checkbox(0), PropID(1), GeoID(2), Type(3), Address(4), Owner(5), DBA(6), ApprValue(7)
                 if len(cells) < 5:
                     continue
-                if len(cells) < 3:
+                if len(cells) < 7:
                     continue
 
-                # Log all cell values for debugging
-                all_vals = [c.inner_text().strip()[:30] for c in cells]
-                
-                # Match by house number — check cells[4] AND cells[3] AND cells[2]
-                # since page structure varies
-                matched = False
-                for idx in [4, 3, 5]:
-                    if idx < len(cells):
-                        val = cells[idx].inner_text().strip().upper()
-                        if val.startswith(house_num + " ") or val.startswith(house_num + ","):
-                            address_cell = val
-                            matched = True
-                            log.info(f"  CAD cells: {all_vals}")
-                            break
+                # cells[4]=Address, cells[6]=Owner Name, cells[8]=Appraised Value
+                address_cell = cells[4].inner_text().strip().upper()
 
-                if not matched:
+                # Match by house number
+                if not (address_cell.startswith(house_num + " ") or address_cell.startswith(house_num + ",")):
                     continue
 
-                # Now find owner name and appraised value by scanning all cells
-                # Owner name: capital letters, spaces, &, . — NOT a number-heavy string
-                detected_owner = ""
-                detected_appr  = ""
-                for ci, cell in enumerate(cells):
-                    txt = cell.inner_text().strip()
-                    if not txt:
-                        continue
-                    # Appraised value: starts with $
-                    if txt.startswith("$") and re.match(r"\$[\d,]+", txt):
-                        detected_appr = re.sub(r"[\$,]", "", txt).strip()
-                    # Owner name: mostly letters, no $ or numeric-heavy
-                    elif (re.match(r"[A-Z][A-Z\s&.,\'\-]+$", txt.upper()) and
-                          len(txt) > 3 and
-                          not re.search(r"\d{4,}", txt) and
-                          txt.upper() not in {"REAL", "PERSONAL", "TYPE", "DBA NAME", "OWNER NAME",
-                                               "PROPERTY ID", "GEOGRAPHIC ID", "APPRAISED VALUE"}):
-                        if not detected_owner or len(txt) > len(detected_owner):
-                            detected_owner = txt
+                owner_cell = cells[6].inner_text().strip() if len(cells) > 6 else ""
+                appr_cell  = cells[8].inner_text().strip() if len(cells) > 8 else ""
 
-                if is_llc_owner(detected_owner.upper()):
-                    log.info(f"  CAD: LLC owner detected '{detected_owner}' — skipping lead")
+                # Safety net: if owner is empty or "View Details", try cells[5]
+                if not owner_cell or owner_cell.lower() in {"view details", "view map", ""}:
+                    owner_cell = cells[5].inner_text().strip() if len(cells) > 5 else ""
+
+                if is_llc_owner(owner_cell.upper()):
+                    log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
                     return None
 
                 matched_row = row
-                result_owner_name = detected_owner
-                result_appraised  = detected_appr
+                result_owner_name = owner_cell
+                result_appraised  = re.sub(r"[\$,]", "", appr_cell).strip()
                 break
             except Exception:
                 continue
@@ -402,13 +378,24 @@ def cad_lookup(page, street):
         except Exception as de:
             log.warning(f"  CAD: deed date extraction failed: {de}")
 
-        log.info(f"  CAD: {owner_name} | {mailing_address} | ${appraised_value} | Last sale: {last_sale_date}")
+        # Extract property type — filter to Single Family only
+        property_type = ""
+        prop_match = re.search(r"Property Use Description:\s*([^\n]+)", detail_text)
+        if prop_match:
+            property_type = prop_match.group(1).strip()
+
+        if property_type and "single family" not in property_type.lower():
+            log.info(f"  CAD: Non-SF property skipped: '{property_type}' — {street}")
+            return None  # Skip non-single-family properties
+
+        log.info(f"  CAD: {owner_name} | {mailing_address} | ${appraised_value} | Last sale: {last_sale_date} | {property_type}")
 
         return {
             "owner_name":      owner_name,
             "mailing_address": mailing_address,
             "appraised_value": appraised_value,
             "last_sale_date":  last_sale_date,
+            "property_type":   property_type,
         }
 
     except Exception as e:
@@ -453,24 +440,26 @@ def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
     Write new row with all data.
     Columns: A=Street, B=City, C=State, D=Zip, E=Recorded Date, F=Sale Date,
              G=(empty), H=Status, I=DK Status, J=BEXAR ID,
-             K=Owner Name, L=Mailing Address, M=Appraised Value, N=Last Sale Date
+             K=Owner Name, L=Mailing Address, M=Appraised Value, N=Last Sale Date, P=Property Type
     """
     street, city, state, zip_ = parse_address(address)
     row = [
-        street,                              # A
-        city,                                # B
-        state,                               # C
-        zip_,                                # D
-        recorded_date,                       # E
-        sale_date,                           # F
-        "",                                  # G
-        "Active",                            # H
-        "",                                  # I (DK Status)
-        bexar_id,                            # J
-        cad_data.get("owner_name", ""),      # K
-        cad_data.get("mailing_address", ""), # L
-        cad_data.get("appraised_value", ""), # M
-        cad_data.get("last_sale_date", ""),  # N
+        street,                               # A
+        city,                                 # B
+        state,                                # C
+        zip_,                                 # D
+        recorded_date,                        # E
+        sale_date,                            # F
+        "",                                   # G
+        "Active",                             # H
+        "",                                   # I (DK Status)
+        bexar_id,                             # J
+        cad_data.get("owner_name", ""),       # K
+        cad_data.get("mailing_address", ""),  # L
+        cad_data.get("appraised_value", ""),  # M
+        cad_data.get("last_sale_date", ""),   # N
+        "",                                   # O (Owner Type - blank for now)
+        cad_data.get("property_type", ""),    # P
     ]
     sheet.append_row(row, value_input_option="USER_ENTERED")
     log.info(f"  New row: {street} | {recorded_date} | {bexar_id} | {cad_data.get('owner_name', 'no owner')}")
@@ -666,7 +655,7 @@ def main():
             summary = (
                 f"Scraper done. {new_count} new | "
                 f"{update_count} refilings | "
-                f"{skipped_llc} LLC skipped"
+                f"{skipped_llc} LLC/non-SF skipped"
             )
             if webhook_failed > 0:
                 summary += f" | {webhook_failed} webhook(s) failed"
