@@ -331,7 +331,8 @@ def cad_lookup(page, street):
             # Find first line starting with a digit (house number) — skip any name overflow lines
             street_match = re.search(r"(?:^|\n)\s*(\d+\s+[^\n%]+?)(?:\s{3,}%|\n|$)", block)
             # Find city/state/zip line
-            city_match   = re.search(r"([A-Z][A-Z\s]+,\s*TX\s+\d{5}[-\d]*)", block)
+            # City line always starts on its own line — anchor to newline to avoid partial matches
+            city_match   = re.search(r"(?:^|\n)\s*([A-Z]+(?:\s+[A-Z]+){0,2},\s*TX\s+\d{5}[-\d]*)", block, re.MULTILINE)
             if street_match and city_match:
                 mailing_address = f"{street_match.group(1).strip()}, {city_match.group(1).strip()}"
             elif street_match:
