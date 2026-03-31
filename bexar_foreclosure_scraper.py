@@ -106,17 +106,23 @@ def parse_address(full_address):
 def strip_street_suffix(street):
     """
     Strip directional prefixes and street suffixes for CAD search.
-    '5715 TIANNA LACE' → '5715 TIANNA'
-    '402 PRESTWICK ST' → '402 PRESTWICK'
+    '5715 TIANNA LACE'  → '5715 TIANNA'
+    '402 PRESTWICK ST'  → '402 PRESTWICK'
+    '203 E LAMBERT ST'  → '203 LAMBERT'  (E stripped from middle)
     """
-    # Remove directional prefixes at the start
+    DIRECTIONALS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW",
+                    "NORTH", "SOUTH", "EAST", "WEST"}
     tokens = street.upper().split()
-    if tokens and tokens[0] in {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}:
-        tokens = tokens[1:]
 
     # Remove trailing suffix words
     while tokens and tokens[-1] in STREET_SUFFIXES:
         tokens = tokens[:-1]
+
+    # Remove directional tokens anywhere except position 0 (house number)
+    # Keep house number (tokens[0]) always
+    if len(tokens) > 1:
+        filtered = [tokens[0]] + [t for t in tokens[1:] if t not in DIRECTIONALS]
+        tokens = filtered
 
     return " ".join(tokens)
 
@@ -261,17 +267,21 @@ def cad_lookup(page, street):
             if len(cells) < 3:
                 continue
             try:
-                address_cell = cells[2].inner_text().strip().upper()
-                owner_cell   = cells[3].inner_text().strip().upper() if len(cells) > 3 else ""
+                # Table columns: checkbox(0), PropID(1), GeoID(2), Type(3), Address(4), Owner(5)
+                if len(cells) < 5:
+                    continue
+                address_cell = cells[4].inner_text().strip().upper()
+                owner_cell   = cells[5].inner_text().strip().upper() if len(cells) > 5 else ""
 
-                # Match by house number
-                if address_cell.startswith(house_num):
+                # Match by house number at start of address
+                if address_cell.startswith(house_num + " ") or address_cell.startswith(house_num + ","):
                     # Check LLC right here in results table — no need to click in
                     if is_llc_owner(owner_cell):
                         log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
                         return None  # None = skip this lead
 
                     matched_row = row
+                    matched_owner = owner_cell
                     break
             except Exception:
                 continue
