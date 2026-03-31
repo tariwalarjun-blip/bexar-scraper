@@ -272,21 +272,55 @@ def cad_lookup(page, street):
                 # Table columns: checkbox(0), PropID(1), GeoID(2), Type(3), Address(4), Owner(5), DBA(6), ApprValue(7)
                 if len(cells) < 5:
                     continue
-                address_cell = cells[4].inner_text().strip().upper()
-                owner_cell   = cells[5].inner_text().strip() if len(cells) > 5 else ""
-                appr_cell    = cells[7].inner_text().strip() if len(cells) > 7 else ""
+                if len(cells) < 3:
+                    continue
 
-                # Match by house number at start of address
-                if address_cell.startswith(house_num + " ") or address_cell.startswith(house_num + ","):
-                    # Check LLC right here in results table — no need to click in
-                    if is_llc_owner(owner_cell.upper()):
-                        log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
-                        return None  # None = skip this lead
+                # Log all cell values for debugging
+                all_vals = [c.inner_text().strip()[:30] for c in cells]
+                
+                # Match by house number — check cells[4] AND cells[3] AND cells[2]
+                # since page structure varies
+                matched = False
+                for idx in [4, 3, 5]:
+                    if idx < len(cells):
+                        val = cells[idx].inner_text().strip().upper()
+                        if val.startswith(house_num + " ") or val.startswith(house_num + ","):
+                            address_cell = val
+                            matched = True
+                            log.info(f"  CAD cells: {all_vals}")
+                            break
 
-                    matched_row = row
-                    result_owner_name = owner_cell
-                    result_appraised  = re.sub(r"[\$,]", "", appr_cell).strip()
-                    break
+                if not matched:
+                    continue
+
+                # Now find owner name and appraised value by scanning all cells
+                # Owner name: capital letters, spaces, &, . — NOT a number-heavy string
+                detected_owner = ""
+                detected_appr  = ""
+                for ci, cell in enumerate(cells):
+                    txt = cell.inner_text().strip()
+                    if not txt:
+                        continue
+                    # Appraised value: starts with $
+                    if txt.startswith("$") and re.match(r"\$[\d,]+", txt):
+                        detected_appr = re.sub(r"[\$,]", "", txt).strip()
+                    # Owner name: mostly letters, no $ or numeric-heavy
+                    elif (re.match(r"[A-Z][A-Z\s&.,\'\-]+$", txt.upper()) and
+                          len(txt) > 3 and
+                          not re.search(r"\d{4,}", txt) and
+                          txt.upper() not in {"REAL", "PERSONAL", "TYPE", "DBA NAME", "OWNER NAME",
+                                               "PROPERTY ID", "GEOGRAPHIC ID", "APPRAISED VALUE"}):
+                        if not detected_owner or len(txt) > len(detected_owner):
+                            detected_owner = txt
+
+                if is_llc_owner(detected_owner.upper()):
+                    log.info(f"  CAD: LLC owner detected '{detected_owner}' — skipping lead")
+                    return None
+
+                matched_row = row
+                result_owner_name = detected_owner
+                result_appraised  = detected_appr
+                break
             except Exception:
                 continue
 
