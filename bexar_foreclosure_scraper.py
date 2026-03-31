@@ -302,34 +302,63 @@ def cad_lookup(page, street):
 
         detail_text = page.locator("body").inner_text()
 
-        # Extract owner name
+        # Extract owner name — stop before "Owner ID:"
         owner_name = ""
-        owner_match = re.search(r"Name:\s*([^\n]+)", detail_text)
+        owner_match = re.search(r"Name:\s*(.+?)(?:\s{2,}Owner ID:|\n)", detail_text)
         if owner_match:
             owner_name = owner_match.group(1).strip()
 
-        # Extract mailing address (two lines after "Mailing Address:")
+        # Extract mailing address — first line stops before "% Ownership"
+        # Second line is the city/state/zip
         mailing_address = ""
-        mail_match = re.search(r"Mailing Address:\s*([^\n]+)\s*\n\s*([^\n]+)", detail_text)
+        mail_match = re.search(
+            r"Mailing Address:\s*(.+?)(?:\s+%\s+Ownership:|\n).*?\n\s*([A-Z][^\n]+,\s*TX\s+\d{5})",
+            detail_text, re.DOTALL
+        )
         if mail_match:
-            mailing_address = f"{mail_match.group(1).strip()}, {mail_match.group(2).strip()}"
+            line1 = mail_match.group(1).strip()
+            line2 = mail_match.group(2).strip()
+            mailing_address = f"{line1}, {line2}"
+        else:
+            # Fallback: just grab first address-looking line after Mailing Address
+            mail_simple = re.search(r"Mailing Address:\s*([^\n%]+)", detail_text)
+            if mail_simple:
+                mailing_address = mail_simple.group(1).strip()
 
-        # Extract appraised value from Values section
+        # Extract appraised value — look for dollar amount near "Appraised"
         appraised_value = ""
-        appr_match = re.search(r"Appraised Value[:\s]+\$?([\d,]+)", detail_text)
+        appr_match = re.search(r"Appraised[^\n]*?\$?\s*([\d,]+)", detail_text)
+        if not appr_match:
+            # Try finding any dollar value in the Values section
+            appr_match = re.search(r"Total[^\n]*?\$?\s*([\d,]+)", detail_text)
         if appr_match:
-            appraised_value = appr_match.group(1).strip()
+            appraised_value = appr_match.group(1).replace(",", "").strip()
 
-        # Extract last sale date — first deed date in Deed History table
+        # Extract last sale date — look for Deed History table
         last_sale_date = ""
-        deed_rows = page.locator("table:has(th:has-text('Deed Date')) tbody tr").all()
-        if deed_rows:
-            try:
-                first_deed_cells = deed_rows[0].locator("td").all()
-                if first_deed_cells:
-                    last_sale_date = first_deed_cells[0].inner_text().strip()
-            except Exception:
-                pass
+        try:
+            # Try multiple selectors for the deed history table
+            deed_selectors = [
+                "table:has(th:has-text('Deed Date')) tbody tr",
+                "table tr:has(td:nth-child(1)):has(td:nth-child(2))",
+            ]
+            for sel in deed_selectors:
+                deed_rows = page.locator(sel).all()
+                if deed_rows:
+                    first_cells = deed_rows[0].locator("td").all()
+                    if first_cells:
+                        candidate = first_cells[0].inner_text().strip()
+                        # Validate it looks like a date
+                        if re.match(r"\d{1,2}/\d{1,2}/\d{4}", candidate):
+                            last_sale_date = candidate
+                            break
+            # Fallback: regex on full text for dates in deed history section
+            if not last_sale_date:
+                deed_section = re.search(r"Deed History.{0,500}?(\d{1,2}/\d{1,2}/\d{4})", detail_text, re.DOTALL)
+                if deed_section:
+                    last_sale_date = deed_section.group(1)
+        except Exception as de:
+            log.warning(f"  CAD: deed date extraction failed: {de}")
 
         log.info(f"  CAD: {owner_name} | {mailing_address} | ${appraised_value} | Last sale: {last_sale_date}")
 
