@@ -1,11 +1,15 @@
 """
-Bexar County Foreclosure Scraper - v13
-- Generates a unique BEXAR-ID for every new lead
-- Writes BEXAR-ID to sheet column J at the same time as the row
-- Sends BEXAR-ID in webhook payload so REsimpli stores it as a custom question
-- DK status Zap looks up sheet rows by BEXAR-ID — 100% reliable, no address matching
-- Refiling SMS alert for existing addresses with new dates
-- Webhook retry logic (3 attempts) so no leads are silently dropped
+Bexar County Foreclosure Scraper - v14
+- All v13 features retained
+- NEW: Bexar CAD lookup for every new address
+  - Searches by house number + stripped street name
+  - Reads owner name from results table
+  - If LLC/CORP/INC/TRUST/LP/LTD → skips entirely, nothing created
+  - Clicks into detail page to get mailing address, appraised value, last sale date
+- Owner data written to sheet columns K-N and included in webhook payload
+- Sheet columns: A=Street, B=City, C=State, D=Zip, E=Recorded Date, F=Sale Date,
+  G=(empty), H=Status, I=DK Status, J=BEXAR ID,
+  K=Owner Name, L=Mailing Address, M=Appraised Value, N=Last Sale Date
 """
 
 import os
@@ -34,6 +38,28 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")
 SMS_TO             = "7262412180@vtext.com"
 MAX_DAYS_BACK      = 30
+
+CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/SearchResults.aspx?cid=110"
+CAD_BASE_URL   = "https://bexar.trueautomation.com"
+
+# Words to strip from street address before CAD search
+STREET_SUFFIXES = {
+    "ST", "STREET", "DR", "DRIVE", "RD", "ROAD", "LN", "LANE",
+    "BLVD", "BOULEVARD", "AVE", "AVENUE", "CT", "COURT", "CIR",
+    "CIRCLE", "WAY", "TRL", "TRAIL", "PKWY", "PARKWAY", "PL",
+    "PLACE", "LOOP", "PASS", "PATH", "RUN", "CV", "COVE", "XING",
+    "CROSSING", "HWY", "HIGHWAY", "LACE", "RIDGE", "GLEN", "PARK",
+    "BEND", "CREEK", "HILLS", "VIEW", "WOOD", "WOODS", "MEADOW",
+    "MEADOWS", "VALLEY", "HOLLOW", "HOLW", "GROVE", "TRACE",
+}
+
+# Owner name fragments that indicate LLC/corporate ownership
+LLC_KEYWORDS = {
+    "LLC", "INC", "CORP", "CORPORATION", "LP", "LTD", "LIMITED",
+    "TRUST", "PROPERTIES", "HOLDINGS", "INVESTMENTS", "REALTY",
+    "REAL ESTATE", "PARTNERS", "GROUP", "ENTERPRISES", "VENTURES",
+    "FUND", "CAPITAL", "ASSETS", "MANAGEMENT",
+}
 
 BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
 
@@ -77,14 +103,36 @@ def parse_address(full_address):
     return street.strip().upper(), city.strip(), state.strip(), zip_.strip()
 
 
+def strip_street_suffix(street):
+    """
+    Strip directional prefixes and street suffixes for CAD search.
+    '5715 TIANNA LACE' → '5715 TIANNA'
+    '402 PRESTWICK ST' → '402 PRESTWICK'
+    """
+    # Remove directional prefixes at the start
+    tokens = street.upper().split()
+    if tokens and tokens[0] in {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}:
+        tokens = tokens[1:]
+
+    # Remove trailing suffix words
+    while tokens and tokens[-1] in STREET_SUFFIXES:
+        tokens = tokens[:-1]
+
+    return " ".join(tokens)
+
+
+def is_llc_owner(owner_name):
+    """Return True if the owner name looks like an LLC or corporate entity."""
+    if not owner_name:
+        return False
+    upper = owner_name.upper()
+    for kw in LLC_KEYWORDS:
+        if kw in upper:
+            return True
+    return False
+
+
 def generate_bexar_id(street, recorded_date):
-    """
-    Generate a unique ID for a lead using street + recorded date.
-    Format: BEXAR-YYYYMMDD-STREETKEY
-    Example: BEXAR-20260326-402PRESTWICK
-    """
-    date_part = recorded_date.replace("/", "")
-    # Convert MM/DD/YYYY to YYYYMMDD
     try:
         d = datetime.strptime(recorded_date, "%m/%d/%Y")
         date_part = d.strftime("%Y%m%d")
@@ -94,7 +142,9 @@ def generate_bexar_id(street, recorded_date):
     return f"BEXAR-{date_part}-{street_key}"
 
 
-def fire_zapier_webhook(address, recorded_date, sale_date, bexar_id, retries=3, delay=5):
+def fire_zapier_webhook(address, recorded_date, sale_date, bexar_id,
+                        owner_name="", mailing_address="", appraised_value="", last_sale_date="",
+                        retries=3, delay=5):
     if not ZAPIER_WEBHOOK_URL:
         log.warning("  ZAPIER_WEBHOOK_URL not set — skipping webhook fire.")
         return False
@@ -103,15 +153,19 @@ def fire_zapier_webhook(address, recorded_date, sale_date, bexar_id, retries=3, 
     full_address = f"{street}, {city}, {state} {zip_}".strip(", ")
 
     payload = json.dumps({
-        "address":       full_address,
-        "street":        street,
-        "city":          city,
-        "state":         state,
-        "zip":           zip_,
-        "recorded_date": recorded_date,
-        "sale_date":     sale_date,
-        "lead_source":   "Foreclosure Auction",
-        "bexar_id":      bexar_id,
+        "address":         full_address,
+        "street":          street,
+        "city":            city,
+        "state":           state,
+        "zip":             zip_,
+        "recorded_date":   recorded_date,
+        "sale_date":       sale_date,
+        "lead_source":     "Foreclosure Auction",
+        "bexar_id":        bexar_id,
+        "owner_name":      owner_name,
+        "mailing_address": mailing_address,
+        "appraised_value": appraised_value,
+        "last_sale_date":  last_sale_date,
     }).encode("utf-8")
 
     for attempt in range(1, retries + 1):
@@ -138,7 +192,6 @@ def fire_zapier_webhook(address, recorded_date, sale_date, bexar_id, retries=3, 
     return False
 
 
-
 def goto_with_retry(page, url, retries=3, delay=5):
     for attempt in range(1, retries + 1):
         try:
@@ -149,6 +202,127 @@ def goto_with_retry(page, url, retries=3, delay=5):
             if attempt < retries:
                 time.sleep(delay)
     return False
+
+
+# ─────────────────────────────────────────────
+# Bexar CAD Lookup
+# ─────────────────────────────────────────────
+
+def cad_lookup(page, street):
+    """
+    Search Bexar CAD for a street address.
+    Returns dict with owner_name, mailing_address, appraised_value, last_sale_date
+    Returns None if LLC/corporate owner (should be skipped)
+    Returns {} if no match found (proceed without CAD data)
+    """
+    search_term = strip_street_suffix(street)
+    if not search_term:
+        log.warning(f"  CAD: Could not build search term from '{street}'")
+        return {}
+
+    log.info(f"  CAD lookup: '{search_term}'")
+
+    try:
+        # Load CAD search page
+        if not goto_with_retry(page, CAD_SEARCH_URL):
+            log.warning("  CAD: Could not load search page")
+            return {}
+
+        # Type search term and submit
+        search_box = page.locator("input[name='PropertySearch']")
+        search_box.fill(search_term)
+        page.keyboard.press("Enter")
+        page.wait_for_load_state("networkidle", timeout=30000)
+        time.sleep(2)
+
+        # Check results count
+        results_text = page.locator("body").inner_text()
+        if "0 of 0" in results_text or "no results" in results_text.lower():
+            log.info(f"  CAD: No results for '{search_term}'")
+            return {}
+
+        # Get all result rows from the table
+        rows = page.locator("table tr").all()
+        matched_row = None
+        house_num = street.split()[0] if street.split() else ""
+
+        for row in rows:
+            cells = row.locator("td").all()
+            if len(cells) < 3:
+                continue
+            try:
+                address_cell = cells[2].inner_text().strip().upper()
+                owner_cell   = cells[3].inner_text().strip().upper() if len(cells) > 3 else ""
+
+                # Match by house number
+                if address_cell.startswith(house_num):
+                    # Check LLC right here in results table — no need to click in
+                    if is_llc_owner(owner_cell):
+                        log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
+                        return None  # None = skip this lead
+
+                    matched_row = row
+                    break
+            except Exception:
+                continue
+
+        if not matched_row:
+            log.info(f"  CAD: No address match for house number {house_num}")
+            return {}
+
+        # Click View Details to get full data
+        detail_link = matched_row.locator("a:has-text('View Details')")
+        if detail_link.count() == 0:
+            log.warning("  CAD: No View Details link found")
+            return {}
+
+        detail_link.first.click()
+        page.wait_for_load_state("networkidle", timeout=30000)
+        time.sleep(2)
+
+        detail_text = page.locator("body").inner_text()
+
+        # Extract owner name
+        owner_name = ""
+        owner_match = re.search(r"Name:\s*([^\n]+)", detail_text)
+        if owner_match:
+            owner_name = owner_match.group(1).strip()
+
+        # Extract mailing address (two lines after "Mailing Address:")
+        mailing_address = ""
+        mail_match = re.search(r"Mailing Address:\s*([^\n]+)\s*\n\s*([^\n]+)", detail_text)
+        if mail_match:
+            mailing_address = f"{mail_match.group(1).strip()}, {mail_match.group(2).strip()}"
+
+        # Extract appraised value from Values section
+        appraised_value = ""
+        appr_match = re.search(r"Appraised Value[:\s]+\$?([\d,]+)", detail_text)
+        if appr_match:
+            appraised_value = appr_match.group(1).strip()
+
+        # Extract last sale date — first deed date in Deed History table
+        last_sale_date = ""
+        deed_rows = page.locator("table:has(th:has-text('Deed Date')) tbody tr").all()
+        if deed_rows:
+            try:
+                first_deed_cells = deed_rows[0].locator("td").all()
+                if first_deed_cells:
+                    last_sale_date = first_deed_cells[0].inner_text().strip()
+            except Exception:
+                pass
+
+        log.info(f"  CAD: {owner_name} | {mailing_address} | ${appraised_value} | Last sale: {last_sale_date}")
+
+        return {
+            "owner_name":      owner_name,
+            "mailing_address": mailing_address,
+            "appraised_value": appraised_value,
+            "last_sale_date":  last_sale_date,
+        }
+
+    except Exception as e:
+        log.warning(f"  CAD lookup failed for '{street}': {e}")
+        return {}
 
 
 # ─────────────────────────────────────────────
@@ -183,13 +357,32 @@ def get_existing_data(sheet):
     return existing_addresses, most_recent_date
 
 
-def append_row(sheet, address, recorded_date, sale_date, bexar_id):
+def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
+    """
+    Write new row with all data.
+    Columns: A=Street, B=City, C=State, D=Zip, E=Recorded Date, F=Sale Date,
+             G=(empty), H=Status, I=DK Status, J=BEXAR ID,
+             K=Owner Name, L=Mailing Address, M=Appraised Value, N=Last Sale Date
+    """
     street, city, state, zip_ = parse_address(address)
-    sheet.append_row(
-        [street, city, state, zip_, recorded_date, sale_date, "", "Active", "", bexar_id],
-        value_input_option="USER_ENTERED",
-    )
-    log.info(f"  New row: {street} | {recorded_date} | {bexar_id}")
+    row = [
+        street,                              # A
+        city,                                # B
+        state,                               # C
+        zip_,                                # D
+        recorded_date,                       # E
+        sale_date,                           # F
+        "",                                  # G
+        "Active",                            # H
+        "",                                  # I (DK Status)
+        bexar_id,                            # J
+        cad_data.get("owner_name", ""),      # K
+        cad_data.get("mailing_address", ""), # L
+        cad_data.get("appraised_value", ""), # M
+        cad_data.get("last_sale_date", ""),  # N
+    ]
+    sheet.append_row(row, value_input_option="USER_ENTERED")
+    log.info(f"  New row: {street} | {recorded_date} | {bexar_id} | {cad_data.get('owner_name', 'no owner')}")
     time.sleep(2)
 
 
@@ -201,9 +394,8 @@ def update_row(sheet, row_index, recorded_date, sale_date):
     log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
 
 
-
 # ─────────────────────────────────────────────
-# Scraper
+# Foreclosure Scraper
 # ─────────────────────────────────────────────
 
 def scrape_page_with_retry(page, url, max_retries=3):
@@ -304,7 +496,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v12")
+    log.info("Bexar County Foreclosure Scraper v14")
     log.info("=" * 60)
 
     try:
@@ -320,46 +512,76 @@ def main():
 
         new_count      = 0
         update_count   = 0
+        skipped_llc    = 0
         webhook_failed = 0
 
-        for f in foreclosures:
-            street, _, _, _ = parse_address(f["address"])
-            key = street.strip().upper()
-            if not key:
-                continue
+        # Single browser session for all CAD lookups
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(viewport={"width": 1280, "height": 900})
+            cad_page = context.new_page()
 
-            row_index = existing_addresses.get(key)
+            for f in foreclosures:
+                street, _, _, _ = parse_address(f["address"])
+                key = street.strip().upper()
+                if not key:
+                    continue
 
-            if row_index is not None:
-                # REFILING — update sheet dates, send SMS alert, do NOT fire webhook
-                update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
-                update_count += 1
-                send_text(
-                    f"Refiled: {street} | "
-                    f"Recorded: {f['recorded_date']} | "
-                    f"Auction: {f['sale_date']}"
-                )
-            else:
-                # NEW LEAD — generate ID, write to sheet, fire webhook
-                bexar_id = generate_bexar_id(street, f["recorded_date"])
-                append_row(sheet, f["address"], f["recorded_date"], f["sale_date"], bexar_id)
-                new_count += 1
-                success = fire_zapier_webhook(f["address"], f["recorded_date"], f["sale_date"], bexar_id)
-                if not success:
-                    webhook_failed += 1
+                row_index = existing_addresses.get(key)
 
-            time.sleep(3)
+                if row_index is not None:
+                    # REFILING — update sheet dates, send SMS alert
+                    update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
+                    update_count += 1
+                    send_text(
+                        f"Refiled: {street} | "
+                        f"Recorded: {f['recorded_date']} | "
+                        f"Auction: {f['sale_date']}"
+                    )
+                else:
+                    # NEW LEAD — CAD lookup first
+                    cad_data = cad_lookup(cad_page, street)
+
+                    if cad_data is None:
+                        # LLC owner — skip entirely
+                        skipped_llc += 1
+                        log.info(f"  Skipped LLC: {street}")
+                        time.sleep(1)
+                        continue
+
+                    # Individual owner — proceed
+                    bexar_id = generate_bexar_id(street, f["recorded_date"])
+                    append_row(sheet, f["address"], f["recorded_date"], f["sale_date"], bexar_id, cad_data)
+                    new_count += 1
+
+                    success = fire_zapier_webhook(
+                        f["address"], f["recorded_date"], f["sale_date"], bexar_id,
+                        owner_name      = cad_data.get("owner_name", ""),
+                        mailing_address = cad_data.get("mailing_address", ""),
+                        appraised_value = cad_data.get("appraised_value", ""),
+                        last_sale_date  = cad_data.get("last_sale_date", ""),
+                    )
+                    if not success:
+                        webhook_failed += 1
+
+                time.sleep(3)
+
+            browser.close()
 
         # Summary SMS
-        if new_count == 0 and update_count == 0:
+        if new_count == 0 and update_count == 0 and skipped_llc == 0:
             send_text("Bexar scraper ran but found 0 records. Check county site manually.")
         else:
-            summary = f"Scraper done. {new_count} new leads to REsimpli | {update_count} refilings"
+            summary = (
+                f"Scraper done. {new_count} new | "
+                f"{update_count} refilings | "
+                f"{skipped_llc} LLC skipped"
+            )
             if webhook_failed > 0:
-                summary += f" | {webhook_failed} webhook(s) failed - check leads manually"
+                summary += f" | {webhook_failed} webhook(s) failed"
             send_text(summary)
 
-        log.info(f"Done. {new_count} new | {update_count} updated | {webhook_failed} webhook failures.")
+        log.info(f"Done. {new_count} new | {update_count} updated | {skipped_llc} LLC skipped | {webhook_failed} webhook failures.")
 
     except Exception as e:
         log.error(f"SCRAPER CRASHED: {e}")
