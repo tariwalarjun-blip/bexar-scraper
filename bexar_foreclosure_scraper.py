@@ -301,6 +301,52 @@ def cad_lookup(page, street):
                 continue
 
         if not matched_row:
+            # Fallback: try searching with just house number + first street word
+            street_words = street.split()
+            if len(street_words) >= 2:
+                fallback_term = f"{street_words[0]} {street_words[1]}"
+                if fallback_term != search_term:
+                    log.info(f"  CAD: No match, trying fallback '{fallback_term}'")
+                    try:
+                        # Go back to search page
+                        goto_with_retry(page, CAD_SEARCH_URL)
+                        for selector in ["input[name='PropertySearch']", "input[type='text']", "#PropertySearch"]:
+                            try:
+                                sb = page.locator(selector).first
+                                sb.wait_for(timeout=8000)
+                                sb.fill(fallback_term)
+                                page.keyboard.press("Enter")
+                                page.wait_for_load_state("networkidle", timeout=30000)
+                                time.sleep(2)
+                                break
+                            except Exception:
+                                continue
+
+                        rows = page.locator("table tr").all()
+                        for row in rows:
+                            cells = row.locator("td").all()
+                            if len(cells) < 7:
+                                continue
+                            try:
+                                address_cell = cells[4].inner_text().strip().upper()
+                                if address_cell.startswith(house_num + " ") or address_cell.startswith(house_num + ","):
+                                    owner_cell = cells[6].inner_text().strip() if len(cells) > 6 else ""
+                                    appr_cell  = cells[8].inner_text().strip() if len(cells) > 8 else ""
+                                    if not owner_cell or owner_cell.lower() in {"view details", "view map", ""}:
+                                        owner_cell = cells[5].inner_text().strip() if len(cells) > 5 else ""
+                                    if is_llc_owner(owner_cell.upper()):
+                                        log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
+                                        return None
+                                    matched_row = row
+                                    result_owner_name = owner_cell
+                                    result_appraised  = re.sub(r"[\$,]", "", appr_cell).strip()
+                                    break
+                            except Exception:
+                                continue
+                    except Exception as fe:
+                        log.warning(f"  CAD: fallback search failed: {fe}")
+
+        if not matched_row:
             log.info(f"  CAD: No address match for house number {house_num}")
             return {}
 
@@ -338,7 +384,8 @@ def cad_lookup(page, street):
             elif street_match:
                 mailing_address = street_match.group(1).strip()
             elif city_match:
-                mailing_address = city_match.group(1).strip()
+                # Only city found — use property address as street (mailing = property)
+                mailing_address = f"{street.title()}, {city_match.group(1).strip()}"
 
         # Appraised value comes from search results table — no need to parse detail page
         appraised_value = result_appraised
