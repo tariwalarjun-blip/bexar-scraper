@@ -39,7 +39,7 @@ ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")
 SMS_TO             = "7262412180@vtext.com"
 MAX_DAYS_BACK      = 30
 
-CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/SearchResults.aspx?cid=110"
+CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/?cid=110"
 CAD_BASE_URL   = "https://bexar.trueautomation.com"
 
 # Words to strip from street address before CAD search
@@ -229,11 +229,21 @@ def cad_lookup(page, street):
             return {}
 
         # Type search term and submit
-        search_box = page.locator("input[name='PropertySearch']")
-        search_box.fill(search_term)
-        page.keyboard.press("Enter")
-        page.wait_for_load_state("networkidle", timeout=30000)
-        time.sleep(2)
+        # Try multiple possible input selectors
+        for selector in ["input[name='PropertySearch']", "input[type='text']", "#PropertySearch", "input.search"]:
+            try:
+                search_box = page.locator(selector).first
+                search_box.wait_for(timeout=10000)
+                search_box.fill(search_term)
+                page.keyboard.press("Enter")
+                page.wait_for_load_state("networkidle", timeout=30000)
+                time.sleep(2)
+                break
+            except Exception:
+                continue
+        else:
+            log.warning(f"  CAD: Could not find search input for '{search_term}'")
+            return {}
 
         # Check results count
         results_text = page.locator("body").inner_text()
