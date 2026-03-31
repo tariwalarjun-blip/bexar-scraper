@@ -366,31 +366,39 @@ def cad_lookup(page, street):
         # Appraised value comes from search results table — no need to parse detail page
         appraised_value = result_appraised
 
-        # Extract last sale date — click Deed History section to expand it first
+        # Extract last sale date — click Deed History to expand, read cells[1] (Deed Date column)
         last_sale_date = ""
         try:
             # Click the Deed History header to expand it
-            deed_header = page.locator("text=Deed History").first
-            if deed_header.count() > 0:
-                deed_header.click()
-                time.sleep(1)
+            for selector in ["text=Deed History", "text=Deed History - (Last 3"]:
+                try:
+                    hdr = page.locator(selector).first
+                    if hdr.count() > 0:
+                        hdr.click()
+                        time.sleep(1.5)
+                        break
+                except Exception:
+                    pass
 
-            # Now try to read the first deed date from the table
-            deed_rows = page.locator("table tr").all()
-            for row in deed_rows:
-                cells = row.locator("td").all()
-                if len(cells) >= 2:
-                    candidate = cells[0].inner_text().strip()
-                    # Must look like a date AND not be today (avoid page footer dates)
-                    if re.match(r"\d{1,2}/\d{1,2}/\d{4}", candidate):
-                        # Parse and verify it's a historical date (before this year)
-                        try:
-                            dt = datetime.strptime(candidate, "%m/%d/%Y")
-                            if dt.year < datetime.now().year:
-                                last_sale_date = candidate
-                                break
-                        except Exception:
-                            pass
+            # Re-read page text after expanding
+            expanded_text = page.locator("body").inner_text()
+            # Find the Deed History section and extract the first date
+            deed_match = re.search(
+                r"Deed Date.+?\n(.{0,300})",
+                expanded_text, re.DOTALL
+            )
+            if deed_match:
+                section = deed_match.group(1)
+                # Find first date in this section that's a past year
+                for m in re.finditer(r"(\d{1,2}/\d{1,2}/\d{4})", section):
+                    candidate = m.group(1)
+                    try:
+                        dt = datetime.strptime(candidate, "%m/%d/%Y")
+                        if dt.year < datetime.now().year:
+                            last_sale_date = candidate
+                            break
+                    except Exception:
+                        pass
         except Exception as de:
             log.warning(f"  CAD: deed date extraction failed: {de}")
 
