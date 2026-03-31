@@ -344,49 +344,53 @@ def cad_lookup(page, street):
         owner_name = result_owner_name
 
         # Extract mailing address
-        # Line 1: street (stops before "% Ownership" or multiple spaces)
-        # Line 2: city, TX zip (on next line, indented)
+        # Bexar CAD quirk: when 2 owners, second name overflows onto first mailing address line
+        # So we look for the first line that STARTS WITH A NUMBER (actual street address)
+        # within the mailing address block, then grab the city/state/zip line after it
         mailing_address = ""
-        # Get street line — stop at % Ownership or 3+ spaces (column separator)
-        mail_line1 = re.search(r"Mailing Address:\s*(\d[^\n%]+?)(?:\s{3,}%|\n)", detail_text)
-        # Get city/state/zip line — find TX + 5-digit zip near mailing address section
-        mail_line2 = re.search(
-            r"Mailing Address:.{0,200}?\n\s*([A-Z][^\n]+,\s*TX\s+\d{5}[-\d]*)",
-            detail_text, re.DOTALL
-        )
-        if mail_line1 and mail_line2:
-            mailing_address = f"{mail_line1.group(1).strip()}, {mail_line2.group(1).strip()}"
-        elif mail_line1:
-            mailing_address = mail_line1.group(1).strip()
-        elif mail_line2:
-            mailing_address = mail_line2.group(1).strip()
+        # Find the mailing address block
+        mail_block = re.search(r"Mailing Address:(.*?)(?:Exemptions:|\Z)", detail_text, re.DOTALL)
+        if mail_block:
+            block = mail_block.group(1)
+            # Find first line starting with a digit (house number) — skip any name overflow lines
+            street_match = re.search(r"(?:^|\n)\s*(\d+\s+[^\n%]+?)(?:\s{3,}%|\n|$)", block)
+            # Find city/state/zip line
+            city_match   = re.search(r"([A-Z][A-Z\s]+,\s*TX\s+\d{5}[-\d]*)", block)
+            if street_match and city_match:
+                mailing_address = f"{street_match.group(1).strip()}, {city_match.group(1).strip()}"
+            elif street_match:
+                mailing_address = street_match.group(1).strip()
+            elif city_match:
+                mailing_address = city_match.group(1).strip()
 
         # Appraised value comes from search results table — no need to parse detail page
         appraised_value = result_appraised
 
-        # Extract last sale date — look for Deed History table
+        # Extract last sale date — click Deed History section to expand it first
         last_sale_date = ""
         try:
-            # Try multiple selectors for the deed history table
-            deed_selectors = [
-                "table:has(th:has-text('Deed Date')) tbody tr",
-                "table tr:has(td:nth-child(1)):has(td:nth-child(2))",
-            ]
-            for sel in deed_selectors:
-                deed_rows = page.locator(sel).all()
-                if deed_rows:
-                    first_cells = deed_rows[0].locator("td").all()
-                    if first_cells:
-                        candidate = first_cells[0].inner_text().strip()
-                        # Validate it looks like a date
-                        if re.match(r"\d{1,2}/\d{1,2}/\d{4}", candidate):
-                            last_sale_date = candidate
-                            break
-            # Fallback: regex on full text for dates in deed history section
-            if not last_sale_date:
-                deed_section = re.search(r"Deed History.{0,500}?(\d{1,2}/\d{1,2}/\d{4})", detail_text, re.DOTALL)
-                if deed_section:
-                    last_sale_date = deed_section.group(1)
+            # Click the Deed History header to expand it
+            deed_header = page.locator("text=Deed History").first
+            if deed_header.count() > 0:
+                deed_header.click()
+                time.sleep(1)
+
+            # Now try to read the first deed date from the table
+            deed_rows = page.locator("table tr").all()
+            for row in deed_rows:
+                cells = row.locator("td").all()
+                if len(cells) >= 2:
+                    candidate = cells[0].inner_text().strip()
+                    # Must look like a date AND not be today (avoid page footer dates)
+                    if re.match(r"\d{1,2}/\d{1,2}/\d{4}", candidate):
+                        # Parse and verify it's a historical date (before this year)
+                        try:
+                            dt = datetime.strptime(candidate, "%m/%d/%Y")
+                            if dt.year < datetime.now().year:
+                                last_sale_date = candidate
+                                break
+                        except Exception:
+                            pass
         except Exception as de:
             log.warning(f"  CAD: deed date extraction failed: {de}")
 
