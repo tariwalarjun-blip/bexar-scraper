@@ -260,6 +260,8 @@ def cad_lookup(page, street):
         # Get all result rows from the table
         rows = page.locator("table tr").all()
         matched_row = None
+        result_owner_name = ""
+        result_appraised  = ""
         house_num = street.split()[0] if street.split() else ""
 
         for row in rows:
@@ -267,21 +269,23 @@ def cad_lookup(page, street):
             if len(cells) < 3:
                 continue
             try:
-                # Table columns: checkbox(0), PropID(1), GeoID(2), Type(3), Address(4), Owner(5)
+                # Table columns: checkbox(0), PropID(1), GeoID(2), Type(3), Address(4), Owner(5), DBA(6), ApprValue(7)
                 if len(cells) < 5:
                     continue
                 address_cell = cells[4].inner_text().strip().upper()
-                owner_cell   = cells[5].inner_text().strip().upper() if len(cells) > 5 else ""
+                owner_cell   = cells[5].inner_text().strip() if len(cells) > 5 else ""
+                appr_cell    = cells[7].inner_text().strip() if len(cells) > 7 else ""
 
                 # Match by house number at start of address
                 if address_cell.startswith(house_num + " ") or address_cell.startswith(house_num + ","):
                     # Check LLC right here in results table — no need to click in
-                    if is_llc_owner(owner_cell):
+                    if is_llc_owner(owner_cell.upper()):
                         log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
                         return None  # None = skip this lead
 
                     matched_row = row
-                    matched_owner = owner_cell
+                    result_owner_name = owner_cell
+                    result_appraised  = re.sub(r"[\$,]", "", appr_cell).strip()
                     break
             except Exception:
                 continue
@@ -302,37 +306,29 @@ def cad_lookup(page, street):
 
         detail_text = page.locator("body").inner_text()
 
-        # Extract owner name — stop before "Owner ID:"
-        owner_name = ""
-        owner_match = re.search(r"Name:\s*(.+?)(?:\s{2,}Owner ID:|\n)", detail_text)
-        if owner_match:
-            owner_name = owner_match.group(1).strip()
+        # Owner name comes from search results table — already clean, no Owner ID contamination
+        owner_name = result_owner_name
 
-        # Extract mailing address — first line stops before "% Ownership"
-        # Second line is the city/state/zip
+        # Extract mailing address
+        # Line 1: street (stops before "% Ownership" or multiple spaces)
+        # Line 2: city, TX zip (on next line, indented)
         mailing_address = ""
-        mail_match = re.search(
-            r"Mailing Address:\s*(.+?)(?:\s+%\s+Ownership:|\n).*?\n\s*([A-Z][^\n]+,\s*TX\s+\d{5})",
+        # Get street line — stop at % Ownership or 3+ spaces (column separator)
+        mail_line1 = re.search(r"Mailing Address:\s*(\d[^\n%]+?)(?:\s{3,}%|\n)", detail_text)
+        # Get city/state/zip line — find TX + 5-digit zip near mailing address section
+        mail_line2 = re.search(
+            r"Mailing Address:.{0,200}?\n\s*([A-Z][^\n]+,\s*TX\s+\d{5}[-\d]*)",
             detail_text, re.DOTALL
         )
-        if mail_match:
-            line1 = mail_match.group(1).strip()
-            line2 = mail_match.group(2).strip()
-            mailing_address = f"{line1}, {line2}"
-        else:
-            # Fallback: just grab first address-looking line after Mailing Address
-            mail_simple = re.search(r"Mailing Address:\s*([^\n%]+)", detail_text)
-            if mail_simple:
-                mailing_address = mail_simple.group(1).strip()
+        if mail_line1 and mail_line2:
+            mailing_address = f"{mail_line1.group(1).strip()}, {mail_line2.group(1).strip()}"
+        elif mail_line1:
+            mailing_address = mail_line1.group(1).strip()
+        elif mail_line2:
+            mailing_address = mail_line2.group(1).strip()
 
-        # Extract appraised value — look for dollar amount near "Appraised"
-        appraised_value = ""
-        appr_match = re.search(r"Appraised[^\n]*?\$?\s*([\d,]+)", detail_text)
-        if not appr_match:
-            # Try finding any dollar value in the Values section
-            appr_match = re.search(r"Total[^\n]*?\$?\s*([\d,]+)", detail_text)
-        if appr_match:
-            appraised_value = appr_match.group(1).replace(",", "").strip()
+        # Appraised value comes from search results table — no need to parse detail page
+        appraised_value = result_appraised
 
         # Extract last sale date — look for Deed History table
         last_sale_date = ""
