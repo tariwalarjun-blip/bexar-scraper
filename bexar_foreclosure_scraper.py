@@ -16,12 +16,8 @@ import os
 import re
 import time
 import logging
-import smtplib
 import json
-import urllib.request
-import urllib.error
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
 from dotenv import load_dotenv
 
 import gspread
@@ -33,10 +29,6 @@ load_dotenv()
 CREDENTIALS_FILE   = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
 SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
 SHEET_TAB          = "Sheet1"
-GMAIL_USER         = os.environ["GMAIL_USER"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")
-SMS_TO             = "7262412180@vtext.com"
 MAX_DAYS_BACK      = 30
 
 CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/?cid=110"
@@ -78,18 +70,6 @@ def parse_date(date_str):
         return None
 
 
-def send_text(message):
-    try:
-        msg = MIMEText(message)
-        msg["From"]    = GMAIL_USER
-        msg["To"]      = SMS_TO
-        msg["Subject"] = ""
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USER, SMS_TO, msg.as_string())
-        log.info(f"  Text sent: {message[:80]}")
-    except Exception as e:
-        log.warning(f"  Text failed: {e}")
 
 
 def parse_address(full_address):
@@ -148,54 +128,6 @@ def generate_bexar_id(street, recorded_date):
     return f"BEXAR-{date_part}-{street_key}"
 
 
-def fire_zapier_webhook(address, recorded_date, sale_date, bexar_id,
-                        owner_name="", mailing_address="", appraised_value="", last_sale_date="",
-                        retries=3, delay=5):
-    if not ZAPIER_WEBHOOK_URL:
-        log.warning("  ZAPIER_WEBHOOK_URL not set — skipping webhook fire.")
-        return False
-
-    street, city, state, zip_ = parse_address(address)
-    full_address = f"{street}, {city}, {state} {zip_}".strip(", ")
-
-    payload = json.dumps({
-        "address":         full_address,
-        "street":          street,
-        "city":            city,
-        "state":           state,
-        "zip":             zip_,
-        "recorded_date":   recorded_date,
-        "sale_date":       sale_date,
-        "lead_source":     "Foreclosure Auction",
-        "bexar_id":        bexar_id,
-        "owner_name":      owner_name,
-        "mailing_address": mailing_address,
-        "appraised_value": appraised_value,
-        "last_sale_date":  last_sale_date,
-    }).encode("utf-8")
-
-    for attempt in range(1, retries + 1):
-        try:
-            req = urllib.request.Request(
-                ZAPIER_WEBHOOK_URL,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                status = resp.getcode()
-                if status == 200:
-                    log.info(f"  Webhook fired OK: {street}")
-                    return True
-                else:
-                    log.warning(f"  Webhook attempt {attempt} returned status {status}")
-        except urllib.error.URLError as e:
-            log.warning(f"  Webhook attempt {attempt}/{retries} failed: {e}")
-        if attempt < retries:
-            time.sleep(delay)
-
-    send_text(f"⚠️ Webhook failed after {retries} attempts for: {street} | {recorded_date}")
-    return False
 
 
 def goto_with_retry(page, url, retries=3, delay=5):
@@ -641,8 +573,7 @@ def main():
         new_count      = 0
         update_count   = 0
         skipped_llc    = 0
-        webhook_failed = 0
-
+        
         # Single browser session for all CAD lookups
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -661,11 +592,7 @@ def main():
                     # REFILING — update sheet dates, send SMS alert
                     update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
                     update_count += 1
-                    send_text(
-                        f"Refiled: {street} | "
-                        f"Recorded: {f['recorded_date']} | "
-                        f"Auction: {f['sale_date']}"
-                    )
+                    log.info(f"  Refiled: {street}")
                 else:
                     # NEW LEAD — CAD lookup first
                     cad_data = cad_lookup(cad_page, street)
@@ -682,38 +609,26 @@ def main():
                     append_row(sheet, f["address"], f["recorded_date"], f["sale_date"], bexar_id, cad_data)
                     new_count += 1
 
-                    success = fire_zapier_webhook(
-                        f["address"], f["recorded_date"], f["sale_date"], bexar_id,
-                        owner_name      = cad_data.get("owner_name", ""),
-                        mailing_address = cad_data.get("mailing_address", ""),
-                        appraised_value = cad_data.get("appraised_value", ""),
-                        last_sale_date  = cad_data.get("last_sale_date", ""),
-                    )
-                    if not success:
-                        webhook_failed += 1
-
                 time.sleep(3)
 
             browser.close()
 
         # Summary SMS
         if new_count == 0 and update_count == 0 and skipped_llc == 0:
-            send_text("Bexar scraper ran but found 0 records. Check county site manually.")
-        else:
+            log.warning("Scraper ran but found 0 records. Check county site manually.")
             summary = (
                 f"Scraper done. {new_count} new | "
                 f"{update_count} refilings | "
                 f"{skipped_llc} LLC/non-SF skipped"
             )
-            if webhook_failed > 0:
-                summary += f" | {webhook_failed} webhook(s) failed"
-            send_text(summary)
+            log.info(f"Summary: {summary}")
 
-        log.info(f"Done. {new_count} new | {update_count} updated | {skipped_llc} LLC skipped | {webhook_failed} webhook failures.")
+        log.info(f"Done. {new_count} new | {update_count} updated | {skipped_llc} LLC skipped.")
+
 
     except Exception as e:
         log.error(f"SCRAPER CRASHED: {e}")
-        send_text(f"Bexar scraper crashed: {str(e)[:120]}")
+        log.error(f"Scraper crashed: {str(e)[:120]}")
         raise
 
 
