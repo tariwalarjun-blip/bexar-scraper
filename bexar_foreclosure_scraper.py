@@ -1,22 +1,24 @@
 """
-Bexar County Foreclosure Scraper - v14
-- All v13 features retained
-- NEW: Bexar CAD lookup for every new address
-  - Searches by house number + stripped street name
-  - Reads owner name from results table
-  - If LLC/CORP/INC/TRUST/LP/LTD → skips entirely, nothing created
-  - Clicks into detail page to get mailing address, appraised value, last sale date
-- Owner data written to sheet columns K-N and included in webhook payload
-- Sheet columns: A=Street, B=City, C=State, D=Zip, E=Recorded Date, F=Sale Date,
-  G=(empty), H=Status, I=DK Status, J=BEXAR ID,
-  K=Owner Name, L=Mailing Address, M=Appraised Value, N=Last Sale Date
+Bexar County Foreclosure Scraper - v15
+Changes from v14:
+- Smarter duplicate handling:
+    Dates same            → skip entirely (no action)
+    Dates changed + DEAD  → reset row with fresh data, new BEXAR ID, logs to Refile Log
+    Dates changed + STATUS CHECK → update dates + reset DK Status to DK1 in sheet
+    Dates changed + DK1-DK10   → update dates only, logs to Refile Log
+- Refile Log: new "Refile Log" tab
+    Columns: Date Detected, Address, Old Recorded Date, New Recorded Date,
+             Old Auction Date, New Auction Date, DK Status, Action Taken
+- Auction date expiry: daily check — if auction date < today and not DEAD → mark DEAD
+- CAD Match flag: column R — YES if CAD found property, NO if not
+- Minimum appraised value filter: skip properties under $80k appraised
+- Days Until Auction: column Q — integer written at row creation time
 """
 
 import os
 import re
 import time
 import logging
-import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -26,15 +28,15 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-CREDENTIALS_FILE   = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
-SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJu2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
-SHEET_TAB          = "Sheet1"
-MAX_DAYS_BACK      = 30
+CREDENTIALS_FILE = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
+SHEET_ID         = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJy2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
+SHEET_TAB        = "Sheet1"
+REFILE_TAB       = "Refile Log"
+MAX_DAYS_BACK    = 30
+MIN_APPRAISAL    = 80000   # Skip properties appraised below this value
 
 CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/?cid=110"
-CAD_BASE_URL   = "https://bexar.trueautomation.com"
 
-# Words to strip from street address before CAD search
 STREET_SUFFIXES = {
     "ST", "STREET", "DR", "DRIVE", "RD", "ROAD", "LN", "LANE",
     "BLVD", "BOULEVARD", "AVE", "AVENUE", "CT", "COURT", "CIR",
@@ -42,10 +44,18 @@ STREET_SUFFIXES = {
     "PLACE", "LOOP", "PASS", "PATH", "RUN", "CV", "COVE", "XING",
     "CROSSING", "HWY", "HIGHWAY", "LACE", "RIDGE", "GLEN", "PARK",
     "BEND", "CREEK", "HILLS", "VIEW", "WOOD", "WOODS", "MEADOW",
-    "MEADOWS", "VALLEY", "HOLLOW", "HOLW", "GROVE", "TRACE",
+    "MEADOWS", "VALLEY", "HOLLOW", "HOLW", "GROVE", "TRACE", "BAY",
+    "VISTA", "KNOLL", "KNOLLS", "SPRING", "SPRINGS", "FALLS",
+    "FIELD", "FIELDS", "POINT", "PT", "POINTE", "TERRACE", "TER",
+    "BLUFF", "BLUFFS", "CANYON", "CLIFF", "CLIFFS", "CREST",
+    "GATE", "GATES", "HAVEN", "HEIGHTS", "HTS", "HILL", "HILLS",
+    "MANOR", "MILL", "MILLS", "MOUNT", "MT", "OVAL", "PIKE",
+    "PINE", "PINES", "PRAIRIE", "RANCH", "RIDGE", "SQUARE", "SQ",
+    "SUMMIT", "TRACE", "TRAIL", "TRAILS", "VILLAGE", "VLG",
+    "WALK", "WELL", "WELLS", "ESTATES", "ESTATE", "LAKES", "LAKE",
+    "SHORES", "SHORE", "CHASE", "COMMON", "COMMONS", "CROSSING",
 }
 
-# Owner name fragments that indicate LLC/corporate ownership
 LLC_KEYWORDS = {
     "LLC", "INC", "CORP", "CORPORATION", "LP", "LTD", "LIMITED",
     "TRUST", "PROPERTIES", "HOLDINGS", "INVESTMENTS", "REALTY",
@@ -53,9 +63,17 @@ LLC_KEYWORDS = {
     "FUND", "CAPITAL", "ASSETS", "MANAGEMENT",
 }
 
-BASE_URL = "https://bexar.tx.publicsearch.us/results?department=FC&limit=50&searchType=advancedSearch&sort=desc&sortBy=recordedDate&offset={offset}"
+BASE_URL = (
+    "https://bexar.tx.publicsearch.us/results"
+    "?department=FC&limit=50&searchType=advancedSearch"
+    "&sort=desc&sortBy=recordedDate&offset={offset}"
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger(__name__)
 
 
@@ -70,8 +88,6 @@ def parse_date(date_str):
         return None
 
 
-
-
 def parse_address(full_address):
     parts  = [p.strip() for p in full_address.split(",")]
     street = parts[0] if parts else full_address
@@ -84,31 +100,18 @@ def parse_address(full_address):
 
 
 def strip_street_suffix(street):
-    """
-    Strip directional prefixes and street suffixes for CAD search.
-    '5715 TIANNA LACE'  → '5715 TIANNA'
-    '402 PRESTWICK ST'  → '402 PRESTWICK'
-    '203 E LAMBERT ST'  → '203 LAMBERT'  (E stripped from middle)
-    """
     DIRECTIONALS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW",
                     "NORTH", "SOUTH", "EAST", "WEST"}
     tokens = street.upper().split()
-
-    # Remove trailing suffix words
     while tokens and tokens[-1] in STREET_SUFFIXES:
         tokens = tokens[:-1]
-
-    # Remove directional tokens anywhere except position 0 (house number)
-    # Keep house number (tokens[0]) always
     if len(tokens) > 1:
         filtered = [tokens[0]] + [t for t in tokens[1:] if t not in DIRECTIONALS]
         tokens = filtered
-
     return " ".join(tokens)
 
 
 def is_llc_owner(owner_name):
-    """Return True if the owner name looks like an LLC or corporate entity."""
     if not owner_name:
         return False
     upper = owner_name.upper()
@@ -128,6 +131,13 @@ def generate_bexar_id(street, recorded_date):
     return f"BEXAR-{date_part}-{street_key}"
 
 
+def days_until_auction(sale_date_str):
+    """Return integer days until auction, or empty string if unknown."""
+    dt = parse_date(sale_date_str)
+    if not dt:
+        return ""
+    delta = (dt.date() - datetime.now().date()).days
+    return max(0, delta)
 
 
 def goto_with_retry(page, url, retries=3, delay=5):
@@ -148,10 +158,9 @@ def goto_with_retry(page, url, retries=3, delay=5):
 
 def cad_lookup(page, street):
     """
-    Search Bexar CAD for a street address.
-    Returns dict with owner_name, mailing_address, appraised_value, last_sale_date
-    Returns None if LLC/corporate owner (should be skipped)
-    Returns {} if no match found (proceed without CAD data)
+    Returns dict with CAD data if found and passes all filters.
+    Returns None  → skip this lead (LLC / non-SF / below min appraisal)
+    Returns {}    → no CAD match found, proceed with empty data
     """
     search_term = strip_street_suffix(street)
     if not search_term:
@@ -161,18 +170,16 @@ def cad_lookup(page, street):
     log.info(f"  CAD lookup: '{search_term}'")
 
     try:
-        # Load CAD search page
         if not goto_with_retry(page, CAD_SEARCH_URL):
             log.warning("  CAD: Could not load search page")
             return {}
 
-        # Type search term and submit
-        # Try multiple possible input selectors
-        for selector in ["input[name='PropertySearch']", "input[type='text']", "#PropertySearch", "input.search"]:
+        for selector in ["input[name='PropertySearch']", "input[type='text']",
+                         "#PropertySearch", "input.search"]:
             try:
-                search_box = page.locator(selector).first
-                search_box.wait_for(timeout=10000)
-                search_box.fill(search_term)
+                sb = page.locator(selector).first
+                sb.wait_for(timeout=10000)
+                sb.fill(search_term)
                 page.keyboard.press("Enter")
                 page.wait_for_load_state("networkidle", timeout=30000)
                 time.sleep(2)
@@ -183,66 +190,63 @@ def cad_lookup(page, street):
             log.warning(f"  CAD: Could not find search input for '{search_term}'")
             return {}
 
-        # Check results count
         results_text = page.locator("body").inner_text()
         if "0 of 0" in results_text or "no results" in results_text.lower():
             log.info(f"  CAD: No results for '{search_term}'")
             return {}
 
-        # Get all result rows from the table
-        rows = page.locator("table tr").all()
-        matched_row = None
+        house_num         = street.split()[0] if street.split() else ""
+        matched_row       = None
         result_owner_name = ""
         result_appraised  = ""
-        house_num = street.split()[0] if street.split() else ""
 
-        for row in rows:
-            cells = row.locator("td").all()
-            if len(cells) < 3:
-                continue
-            try:
-                # Table columns: checkbox(0), PropID(1), GeoID(2), Type(3), Address(4), Owner(5), DBA(6), ApprValue(7)
-                if len(cells) < 5:
-                    continue
+        def try_match_rows(rows):
+            nonlocal matched_row, result_owner_name, result_appraised
+            for row in rows:
+                cells = row.locator("td").all()
                 if len(cells) < 7:
                     continue
+                try:
+                    address_cell = cells[4].inner_text().strip().upper()
+                    if not (address_cell.startswith(house_num + " ") or
+                            address_cell.startswith(house_num + ",")):
+                        continue
 
-                # cells[4]=Address, cells[6]=Owner Name, cells[8]=Appraised Value
-                address_cell = cells[4].inner_text().strip().upper()
+                    owner_cell = cells[6].inner_text().strip() if len(cells) > 6 else ""
+                    appr_cell  = cells[8].inner_text().strip() if len(cells) > 8 else ""
 
-                # Match by house number
-                if not (address_cell.startswith(house_num + " ") or address_cell.startswith(house_num + ",")):
+                    if not owner_cell or owner_cell.lower() in {"view details", "view map", ""}:
+                        owner_cell = cells[5].inner_text().strip() if len(cells) > 5 else ""
+
+                    if is_llc_owner(owner_cell.upper()):
+                        log.info(f"  CAD: LLC owner '{owner_cell}' — skipping")
+                        return "LLC"
+
+                    matched_row       = row
+                    result_owner_name = owner_cell
+                    result_appraised  = re.sub(r"[$,]", "", appr_cell).strip()
+                    return "FOUND"
+                except Exception:
                     continue
+            return "NONE"
 
-                owner_cell = cells[6].inner_text().strip() if len(cells) > 6 else ""
-                appr_cell  = cells[8].inner_text().strip() if len(cells) > 8 else ""
+        rows   = page.locator("table tr").all()
+        status = try_match_rows(rows)
 
-                # Safety net: if owner is empty or "View Details", try cells[5]
-                if not owner_cell or owner_cell.lower() in {"view details", "view map", ""}:
-                    owner_cell = cells[5].inner_text().strip() if len(cells) > 5 else ""
+        if status == "LLC":
+            return None
 
-                if is_llc_owner(owner_cell.upper()):
-                    log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
-                    return None
-
-                matched_row = row
-                result_owner_name = owner_cell
-                result_appraised  = re.sub(r"[\$,]", "", appr_cell).strip()
-                break
-            except Exception:
-                continue
-
-        if not matched_row:
-            # Fallback: try searching with just house number + first street word
+        if status == "NONE":
+            # Fallback: house number + first street word only
             street_words = street.split()
             if len(street_words) >= 2:
                 fallback_term = f"{street_words[0]} {street_words[1]}"
                 if fallback_term != search_term:
                     log.info(f"  CAD: No match, trying fallback '{fallback_term}'")
                     try:
-                        # Go back to search page
                         goto_with_retry(page, CAD_SEARCH_URL)
-                        for selector in ["input[name='PropertySearch']", "input[type='text']", "#PropertySearch"]:
+                        for selector in ["input[name='PropertySearch']",
+                                         "input[type='text']", "#PropertySearch"]:
                             try:
                                 sb = page.locator(selector).first
                                 sb.wait_for(timeout=8000)
@@ -253,28 +257,9 @@ def cad_lookup(page, street):
                                 break
                             except Exception:
                                 continue
-
-                        rows = page.locator("table tr").all()
-                        for row in rows:
-                            cells = row.locator("td").all()
-                            if len(cells) < 7:
-                                continue
-                            try:
-                                address_cell = cells[4].inner_text().strip().upper()
-                                if address_cell.startswith(house_num + " ") or address_cell.startswith(house_num + ","):
-                                    owner_cell = cells[6].inner_text().strip() if len(cells) > 6 else ""
-                                    appr_cell  = cells[8].inner_text().strip() if len(cells) > 8 else ""
-                                    if not owner_cell or owner_cell.lower() in {"view details", "view map", ""}:
-                                        owner_cell = cells[5].inner_text().strip() if len(cells) > 5 else ""
-                                    if is_llc_owner(owner_cell.upper()):
-                                        log.info(f"  CAD: LLC owner detected '{owner_cell}' — skipping lead")
-                                        return None
-                                    matched_row = row
-                                    result_owner_name = owner_cell
-                                    result_appraised  = re.sub(r"[\$,]", "", appr_cell).strip()
-                                    break
-                            except Exception:
-                                continue
+                        fb_status = try_match_rows(page.locator("table tr").all())
+                        if fb_status == "LLC":
+                            return None
                     except Exception as fe:
                         log.warning(f"  CAD: fallback search failed: {fe}")
 
@@ -282,7 +267,20 @@ def cad_lookup(page, street):
             log.info(f"  CAD: No address match for house number {house_num}")
             return {}
 
-        # Click View Details to get full data
+        # ── Minimum appraised value filter ──────────────────────────────
+        if result_appraised:
+            try:
+                appr_num = float(re.sub(r"[^\d.]", "", result_appraised))
+                if appr_num < MIN_APPRAISAL:
+                    log.info(
+                        f"  CAD: Appraised ${appr_num:,.0f} below "
+                        f"${MIN_APPRAISAL:,} minimum — skipping: {street}"
+                    )
+                    return None
+            except Exception:
+                pass
+
+        # ── Click View Details ───────────────────────────────────────────
         detail_link = matched_row.locator("a:has-text('View Details')")
         if detail_link.count() == 0:
             log.warning("  CAD: No View Details link found")
@@ -293,39 +291,36 @@ def cad_lookup(page, street):
         time.sleep(2)
 
         detail_text = page.locator("body").inner_text()
+        owner_name  = result_owner_name
 
-        # Owner name comes from search results table — already clean, no Owner ID contamination
-        owner_name = result_owner_name
-
-        # Extract mailing address
-        # Bexar CAD quirk: when 2 owners, second name overflows onto first mailing address line
-        # So we look for the first line that STARTS WITH A NUMBER (actual street address)
-        # within the mailing address block, then grab the city/state/zip line after it
+        # ── Mailing address ──────────────────────────────────────────────
         mailing_address = ""
-        # Find the mailing address block
-        mail_block = re.search(r"Mailing Address:(.*?)(?:Exemptions:|\Z)", detail_text, re.DOTALL)
+        mail_block = re.search(
+            r"Mailing Address:(.*?)(?:Exemptions:|\Z)", detail_text, re.DOTALL
+        )
         if mail_block:
             block = mail_block.group(1)
-            # Find first line starting with a digit (house number) — skip any name overflow lines
-            street_match = re.search(r"(?:^|\n)\s*(\d+\s+[^\n%]+?)(?:\s{3,}%|\n|$)", block)
-            # Find city/state/zip line
-            # City line always starts on its own line — anchor to newline to avoid partial matches
-            city_match   = re.search(r"(?:^|\n)\s*([A-Z]+(?:\s+[A-Z]+){0,2},\s*TX\s+\d{5}[-\d]*)", block, re.MULTILINE)
+            street_match = re.search(
+                r"(?:^|\n)\s*(\d+\s+[^\n%]+?)(?:\s{3,}%|\n|$)", block
+            )
+            city_match = re.search(
+                r"(?:^|\n)\s*([A-Z]+(?:\s+[A-Z]+){0,2},\s*TX\s+\d{5}[-\d]*)",
+                block, re.MULTILINE,
+            )
             if street_match and city_match:
-                mailing_address = f"{street_match.group(1).strip()}, {city_match.group(1).strip()}"
+                mailing_address = (
+                    f"{street_match.group(1).strip()}, {city_match.group(1).strip()}"
+                )
             elif street_match:
                 mailing_address = street_match.group(1).strip()
             elif city_match:
-                # Only city found — use property address as street (mailing = property)
                 mailing_address = f"{street.title()}, {city_match.group(1).strip()}"
 
-        # Appraised value comes from search results table — no need to parse detail page
         appraised_value = result_appraised
 
-        # Extract last sale date — click Deed History to expand, read cells[1] (Deed Date column)
+        # ── Last sale date ───────────────────────────────────────────────
         last_sale_date = ""
         try:
-            # Click the Deed History header to expand it
             for selector in ["text=Deed History", "text=Deed History - (Last 3"]:
                 try:
                     hdr = page.locator(selector).first
@@ -336,17 +331,10 @@ def cad_lookup(page, street):
                 except Exception:
                     pass
 
-            # Re-read page text after expanding
             expanded_text = page.locator("body").inner_text()
-            # Find the Deed History section and extract the first date
-            deed_match = re.search(
-                r"Deed Date.+?\n(.{0,300})",
-                expanded_text, re.DOTALL
-            )
+            deed_match = re.search(r"Deed Date.+?\n(.{0,300})", expanded_text, re.DOTALL)
             if deed_match:
-                section = deed_match.group(1)
-                # Find first date in this section that's a past year
-                for m in re.finditer(r"(\d{1,2}/\d{1,2}/\d{4})", section):
+                for m in re.finditer(r"(\d{1,2}/\d{1,2}/\d{4})", deed_match.group(1)):
                     candidate = m.group(1)
                     try:
                         dt = datetime.strptime(candidate, "%m/%d/%Y")
@@ -358,17 +346,20 @@ def cad_lookup(page, street):
         except Exception as de:
             log.warning(f"  CAD: deed date extraction failed: {de}")
 
-        # Extract property type — filter to Single Family only
+        # ── Property type — SF filter ────────────────────────────────────
         property_type = ""
         prop_match = re.search(r"Property Use Description:\s*([^\n]+)", detail_text)
         if prop_match:
             property_type = prop_match.group(1).strip()
 
         if property_type and "single family" not in property_type.lower():
-            log.info(f"  CAD: Non-SF property skipped: '{property_type}' — {street}")
-            return None  # Skip non-single-family properties
+            log.info(f"  CAD: Non-SF '{property_type}' — skipping: {street}")
+            return None
 
-        log.info(f"  CAD: {owner_name} | {mailing_address} | ${appraised_value} | Last sale: {last_sale_date} | {property_type}")
+        log.info(
+            f"  CAD: {owner_name} | {mailing_address} | "
+            f"${appraised_value} | Last sale: {last_sale_date} | {property_type}"
+        )
 
         return {
             "owner_name":      owner_name,
@@ -384,46 +375,91 @@ def cad_lookup(page, street):
 
 
 # ─────────────────────────────────────────────
-# Google Sheets
+# Google Sheets helpers
 # ─────────────────────────────────────────────
 
-def get_sheets():
+def get_workbook():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    wb = gspread.authorize(creds).open_by_key(SHEET_ID)
+    return gspread.authorize(creds).open_by_key(SHEET_ID)
+
+
+def get_main_sheet(wb):
     return wb.worksheet(SHEET_TAB)
 
 
+def get_refile_log(wb):
+    try:
+        return wb.worksheet(REFILE_TAB)
+    except Exception:
+        log.info("  Creating 'Refile Log' tab...")
+        relog = wb.add_worksheet(title=REFILE_TAB, rows=1000, cols=10)
+        relog.append_row([
+            "Date Detected", "Address",
+            "Old Recorded Date", "New Recorded Date",
+            "Old Auction Date",  "New Auction Date",
+            "DK Status", "Action Taken",
+        ])
+        return relog
+
+
 def get_existing_data(sheet):
+    """
+    Returns:
+      existing: dict keyed by street_upper →
+        { row_index, dk_status, recorded_date, auction_date }
+      most_recent_date: datetime of most recent recorded date
+    """
     rows = sheet.get_all_values()
-    existing_addresses = {}
-    all_dates = []
+    existing      = {}
+    all_dates     = []
 
     for i, row in enumerate(rows[1:], start=2):
-        street = row[0].strip() if len(row) > 0 else ""
-        if street:
-            existing_addresses[street.upper()] = i
-        if len(row) > 4 and row[4].strip():
-            d = parse_date(row[4])
-            if d:
-                all_dates.append(d)
+        street = row[0].strip().upper() if len(row) > 0 else ""
+        if not street:
+            continue
+        recorded_date = row[4].strip() if len(row) > 4 else ""
+        auction_date  = row[5].strip() if len(row) > 5 else ""
+        dk_status     = row[8].strip().upper() if len(row) > 8 else ""  # col I
 
-    most_recent_date = max(all_dates) if all_dates else None
-    return existing_addresses, most_recent_date
+        existing[street] = {
+            "row_index":    i,
+            "dk_status":    dk_status,
+            "recorded_date": recorded_date,
+            "auction_date":  auction_date,
+        }
+
+        d = parse_date(recorded_date)
+        if d:
+            all_dates.append(d)
+
+    most_recent = max(all_dates) if all_dates else None
+    return existing, most_recent
 
 
-def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
-    """
-    Write new row with all data.
-    Columns: A=Street, B=City, C=State, D=Zip, E=Recorded Date, F=Sale Date,
-             G=(empty), H=Status, I=DK Status, J=BEXAR ID,
-             K=Owner Name, L=Mailing Address, M=Appraised Value, N=Last Sale Date, P=Property Type
-    """
+def log_refile(refile_sheet, address, old_rec, new_rec,
+               old_auction, new_auction, dk_status, action):
+    refile_sheet.append_row([
+        datetime.now().strftime("%m/%d/%Y"),
+        address,
+        old_rec,
+        new_rec,
+        old_auction,
+        new_auction,
+        dk_status,
+        action,
+    ])
+    time.sleep(1)
+
+
+def build_row(address, recorded_date, sale_date, bexar_id, cad_data):
+    """Build the 18-column row list (A through R)."""
     street, city, state, zip_ = parse_address(address)
-    row = [
+    cad_match = "YES" if cad_data.get("owner_name") else "NO"
+    return [
         street,                               # A
         city,                                 # B
         state,                                # C
@@ -432,30 +468,101 @@ def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
         sale_date,                            # F
         "",                                   # G
         "Active",                             # H
-        "",                                   # I (DK Status)
+        "",                                   # I  DK Status (blank = new)
         bexar_id,                             # J
         cad_data.get("owner_name", ""),       # K
         cad_data.get("mailing_address", ""),  # L
         cad_data.get("appraised_value", ""),  # M
         cad_data.get("last_sale_date", ""),   # N
-        "",                                   # O (Owner Type - blank for now)
+        "",                                   # O  Owner Type
         cad_data.get("property_type", ""),    # P
+        str(days_until_auction(sale_date)),   # Q  Days Until Auction
+        cad_match,                            # R  CAD Match
     ]
+
+
+def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
+    row = build_row(address, recorded_date, sale_date, bexar_id, cad_data)
     sheet.append_row(row, value_input_option="USER_ENTERED")
-    log.info(f"  New row: {street} | {recorded_date} | {bexar_id} | {cad_data.get('owner_name', 'no owner')}")
+    street = row[0]
+    log.info(
+        f"  New row: {street} | {recorded_date} | {bexar_id} | "
+        f"{cad_data.get('owner_name', 'no owner')}"
+    )
     time.sleep(2)
 
 
-def update_row(sheet, row_index, recorded_date, sale_date):
+def reset_dead_row(sheet, row_index, address, recorded_date, sale_date,
+                   bexar_id, cad_data):
+    """Overwrite an existing DEAD row with fresh lead data."""
+    row = build_row(address, recorded_date, sale_date, bexar_id, cad_data)
+    cell_range = f"A{row_index}:R{row_index}"
+    sheet.update(cell_range, [row], value_input_option="USER_ENTERED")
+    street = row[0]
+    log.info(f"  Reset DEAD row {row_index}: {street} | {recorded_date} | {bexar_id}")
+    time.sleep(2)
+
+
+def update_dates_only(sheet, row_index, recorded_date, sale_date):
     sheet.update_cell(row_index, 5, recorded_date)
-    time.sleep(2)
+    time.sleep(1)
     sheet.update_cell(row_index, 6, sale_date)
-    time.sleep(2)
-    log.info(f"  Updated row {row_index}: {recorded_date} / {sale_date}")
+    time.sleep(1)
+    # Refresh Days Until Auction (col Q = 17)
+    dua = str(days_until_auction(sale_date))
+    sheet.update_cell(row_index, 17, dua)
+    time.sleep(1)
+    log.info(f"  Updated dates row {row_index}: {recorded_date} / {sale_date}")
+
+
+def update_dates_and_reset_dk(sheet, row_index, recorded_date, sale_date):
+    """For STATUS CHECK refilers: update dates AND reset DK status to DK1."""
+    sheet.update_cell(row_index, 5, recorded_date)   # E
+    time.sleep(1)
+    sheet.update_cell(row_index, 6, sale_date)        # F
+    time.sleep(1)
+    sheet.update_cell(row_index, 9, "DK1")            # I
+    time.sleep(1)
+    dua = str(days_until_auction(sale_date))
+    sheet.update_cell(row_index, 17, dua)             # Q
+    time.sleep(1)
+    log.info(f"  Updated dates + reset DK1 row {row_index}: {recorded_date} / {sale_date}")
 
 
 # ─────────────────────────────────────────────
-# Foreclosure Scraper
+# Auction date expiry check
+# ─────────────────────────────────────────────
+
+def expire_old_leads(sheet, existing):
+    """Mark DEAD any lead whose auction date has already passed."""
+    today         = datetime.now().date()
+    expired_count = 0
+
+    for street, data in existing.items():
+        auction_date = data.get("auction_date", "")
+        dk_status    = data.get("dk_status", "")
+        row_index    = data["row_index"]
+
+        if not auction_date or dk_status == "DEAD":
+            continue
+
+        auction_dt = parse_date(auction_date)
+        if auction_dt and auction_dt.date() < today:
+            sheet.update_cell(row_index, 9, "DEAD")   # col I
+            time.sleep(1)
+            expired_count += 1
+            log.info(f"  Expired (auction passed {auction_date}): {street}")
+            # Update the in-memory dict so refile logic sees it as DEAD
+            data["dk_status"] = "DEAD"
+
+    if expired_count:
+        log.info(f"  Marked {expired_count} lead(s) DEAD — auction date passed")
+
+    return expired_count
+
+
+# ─────────────────────────────────────────────
+# Foreclosure scraper
 # ─────────────────────────────────────────────
 
 def scrape_page_with_retry(page, url, max_retries=3):
@@ -463,8 +570,9 @@ def scrape_page_with_retry(page, url, max_retries=3):
         if not goto_with_retry(page, url):
             return []
         time.sleep(3)
-        rows = page.locator("table tbody tr").all()
-        data_rows = [r for r in rows if re.search(r"\d{1,2}/\d{1,2}/\d{4}", r.inner_text())]
+        rows      = page.locator("table tbody tr").all()
+        data_rows = [r for r in rows
+                     if re.search(r"\d{1,2}/\d{1,2}/\d{4}", r.inner_text())]
         if data_rows:
             return rows
         log.warning(f"  0 data rows on attempt {attempt}/{max_retries} — retrying in 10s...")
@@ -474,9 +582,8 @@ def scrape_page_with_retry(page, url, max_retries=3):
 
 
 def scrape_foreclosures(most_recent_date):
-    results = []
-    done    = False
-
+    results     = []
+    done        = False
     hard_cutoff = datetime.now() - timedelta(days=MAX_DAYS_BACK)
     stop_date   = max(most_recent_date, hard_cutoff) if most_recent_date else hard_cutoff
     log.info(f"Stop date: {stop_date.strftime('%m/%d/%Y')}")
@@ -490,10 +597,9 @@ def scrape_foreclosures(most_recent_date):
         page_num = 1
 
         while not done:
-            results_url = BASE_URL.format(offset=offset)
+            url  = BASE_URL.format(offset=offset)
             log.info(f"Loading page {page_num} (offset={offset})...")
-
-            rows = scrape_page_with_retry(page, results_url)
+            rows = scrape_page_with_retry(page, url)
             if not rows:
                 log.error(f"  Giving up on page {page_num} after retries.")
                 break
@@ -503,8 +609,8 @@ def scrape_foreclosures(most_recent_date):
                 try:
                     cells     = row.locator("td").all()
                     cell_text = [c.inner_text().strip() for c in cells]
-
-                    dates = [v for v in cell_text if re.match(r"\d{1,2}/\d{1,2}/\d{4}", v)]
+                    dates     = [v for v in cell_text
+                                 if re.match(r"\d{1,2}/\d{1,2}/\d{4}", v)]
                     if not dates:
                         continue
 
@@ -530,18 +636,15 @@ def scrape_foreclosures(most_recent_date):
                             "recorded_date": recorded_date,
                             "sale_date":     sale_date,
                         })
-
                 except Exception as e:
                     log.warning(f"  Row error: {e}")
 
             log.info(f"  Data rows this page: {data_rows}")
-
             if done or data_rows == 0:
                 break
             if data_rows < 50:
                 log.info("  Last page reached.")
                 break
-
             offset   += 50
             page_num += 1
 
@@ -556,28 +659,34 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v14")
+    log.info("Bexar County Foreclosure Scraper v15")
     log.info("=" * 60)
 
     try:
-        sheet = get_sheets()
-        existing_addresses, most_recent = get_existing_data(sheet)
+        wb           = get_workbook()
+        sheet        = get_main_sheet(wb)
+        refile_sheet = get_refile_log(wb)
+
+        existing, most_recent = get_existing_data(sheet)
         log.info(
-            f"Existing records: {len(existing_addresses)} | "
+            f"Existing records: {len(existing)} | "
             f"Most recent date: {most_recent.strftime('%m/%d/%Y') if most_recent else 'none'}"
         )
 
+        # ── Step 1: expire leads whose auction date has passed ─────────
+        expired = expire_old_leads(sheet, existing)
+
+        # ── Step 2: scrape county site ──────────────────────────────────
         foreclosures = scrape_foreclosures(most_recent)
         log.info(f"Records to process: {len(foreclosures)}")
 
-        new_count      = 0
-        update_count   = 0
-        skipped_llc    = 0
-        
-        # Single browser session for all CAD lookups
+        new_count    = 0
+        update_count = 0
+        skipped      = 0
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(viewport={"width": 1280, "height": 900})
+            browser  = p.chromium.launch(headless=True)
+            context  = browser.new_context(viewport={"width": 1280, "height": 900})
             cad_page = context.new_page()
 
             for f in foreclosures:
@@ -586,49 +695,91 @@ def main():
                 if not key:
                     continue
 
-                row_index = existing_addresses.get(key)
+                row_data = existing.get(key)
 
-                if row_index is not None:
-                    # REFILING — update sheet dates, send SMS alert
-                    update_row(sheet, row_index, f["recorded_date"], f["sale_date"])
-                    update_count += 1
-                    log.info(f"  Refiled: {street}")
+                # ── DUPLICATE ──────────────────────────────────────────
+                if row_data is not None:
+                    existing_rec    = row_data["recorded_date"]
+                    existing_auction = row_data["auction_date"]
+                    new_rec          = f["recorded_date"]
+                    new_auction      = f["sale_date"]
+                    dk_status        = row_data["dk_status"]
+                    row_index        = row_data["row_index"]
+
+                    # A: Dates unchanged → skip entirely
+                    if existing_rec == new_rec and existing_auction == new_auction:
+                        log.info(f"  Skip (same dates): {street}")
+                        continue
+
+                    # C: Dates changed — true refile
+                    log.info(
+                        f"  Refile detected: {street} | "
+                        f"auction {existing_auction} → {new_auction} | "
+                        f"DK: {dk_status}"
+                    )
+
+                    if dk_status == "DEAD":
+                        # Full reset — run CAD lookup again for fresh data
+                        cad_data = cad_lookup(cad_page, street)
+
+                        if cad_data is None:
+                            log.info(f"  Refile: still LLC/non-SF/low-value — keeping DEAD: {street}")
+                            log_refile(refile_sheet, street, existing_rec, new_rec,
+                                       existing_auction, new_auction, dk_status,
+                                       "Kept DEAD — LLC/non-SF/below min value")
+                            skipped += 1
+                        else:
+                            bexar_id = generate_bexar_id(street, new_rec)
+                            reset_dead_row(sheet, row_index, f["address"],
+                                           new_rec, new_auction, bexar_id, cad_data or {})
+                            log_refile(refile_sheet, street, existing_rec, new_rec,
+                                       existing_auction, new_auction, dk_status,
+                                       "Reset row — was DEAD, refiled as new lead")
+                            update_count += 1
+
+                    elif dk_status == "STATUS CHECK":
+                        update_dates_and_reset_dk(sheet, row_index, new_rec, new_auction)
+                        log_refile(refile_sheet, street, existing_rec, new_rec,
+                                   existing_auction, new_auction, dk_status,
+                                   "Updated dates + reset DK status to DK1")
+                        update_count += 1
+
+                    else:
+                        # DK1 / DK2 / DK3 / DK4-10 → dates only
+                        update_dates_only(sheet, row_index, new_rec, new_auction)
+                        log_refile(refile_sheet, street, existing_rec, new_rec,
+                                   existing_auction, new_auction, dk_status,
+                                   f"Updated dates only — {dk_status}")
+                        update_count += 1
+
+                # ── NEW LEAD ───────────────────────────────────────────
                 else:
-                    # NEW LEAD — CAD lookup first
                     cad_data = cad_lookup(cad_page, street)
 
                     if cad_data is None:
-                        # LLC owner — skip entirely
-                        skipped_llc += 1
-                        log.info(f"  Skipped LLC: {street}")
+                        skipped += 1
+                        log.info(f"  Skipped (LLC/non-SF/low-value): {street}")
                         time.sleep(1)
                         continue
 
-                    # Individual owner — proceed
                     bexar_id = generate_bexar_id(street, f["recorded_date"])
-                    append_row(sheet, f["address"], f["recorded_date"], f["sale_date"], bexar_id, cad_data)
+                    append_row(sheet, f["address"], f["recorded_date"],
+                               f["sale_date"], bexar_id, cad_data or {})
                     new_count += 1
 
-                time.sleep(3)
+                time.sleep(2)
 
             browser.close()
 
-        # Summary SMS
-        if new_count == 0 and update_count == 0 and skipped_llc == 0:
-            log.warning("Scraper ran but found 0 records. Check county site manually.")
-            summary = (
-                f"Scraper done. {new_count} new | "
-                f"{update_count} refilings | "
-                f"{skipped_llc} LLC/non-SF skipped"
-            )
-            log.info(f"Summary: {summary}")
-
-        log.info(f"Done. {new_count} new | {update_count} updated | {skipped_llc} LLC skipped.")
-
+        log.info("=" * 60)
+        log.info(
+            f"Done. {new_count} new | {update_count} refiled | "
+            f"{skipped} skipped | {expired} expired"
+        )
+        log.info("=" * 60)
 
     except Exception as e:
         log.error(f"SCRAPER CRASHED: {e}")
-        log.error(f"Scraper crashed: {str(e)[:120]}")
         raise
 
 
