@@ -13,12 +13,15 @@ Changes from v14:
 - CAD Match flag: column R — YES if CAD found property, NO if not
 - Minimum appraised value filter: skip properties under $80k appraised
 - Days Until Auction: column Q — integer written at row creation time
+- Zapier webhook ping on new row append and DEAD row reset (triggers sheet→podio Zap)
 """
 
 import os
 import re
 import time
+import json
 import logging
+import urllib.request
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -28,12 +31,13 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-CREDENTIALS_FILE = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
-SHEET_ID         = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJy2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
-SHEET_TAB        = "Sheet1"
-REFILE_TAB       = "Refile Log"
-MAX_DAYS_BACK    = 30
-MIN_APPRAISAL    = 80000   # Skip properties appraised below this value
+CREDENTIALS_FILE   = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
+SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJy2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
+ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")
+SHEET_TAB          = "Sheet1"
+REFILE_TAB         = "Refile Log"
+MAX_DAYS_BACK      = 30
+MIN_APPRAISAL      = 80000   # Skip properties appraised below this value
 
 CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/?cid=110"
 
@@ -153,6 +157,30 @@ def goto_with_retry(page, url, retries=3, delay=5):
 
 
 # ─────────────────────────────────────────────
+# Zapier webhook ping
+# ─────────────────────────────────────────────
+
+def ping_zapier(row_data: dict):
+    """POST row data to Zapier webhook to trigger the sheet→Podio Zap."""
+    if not ZAPIER_WEBHOOK_URL:
+        log.warning("  ZAPIER_WEBHOOK_URL not set — skipping webhook ping")
+        return
+    try:
+        payload = json.dumps(row_data).encode("utf-8")
+        req = urllib.request.Request(
+            ZAPIER_WEBHOOK_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.getcode()
+            log.info(f"  Zapier webhook ping: HTTP {status}")
+    except Exception as e:
+        log.warning(f"  Zapier webhook ping failed: {e}")
+
+
+# ─────────────────────────────────────────────
 # Bexar CAD Lookup
 # ─────────────────────────────────────────────
 
@@ -237,7 +265,6 @@ def cad_lookup(page, street):
             return None
 
         if status == "NONE":
-            # Fallback: house number + first street word only
             street_words = street.split()
             if len(street_words) >= 2:
                 fallback_term = f"{street_words[0]} {street_words[1]}"
@@ -481,6 +508,28 @@ def build_row(address, recorded_date, sale_date, bexar_id, cad_data):
     ]
 
 
+def row_to_webhook_payload(row):
+    """Map the 18-column row list to named fields for the Zapier webhook."""
+    return {
+        "street":          row[0],
+        "city":            row[1],
+        "state":           row[2],
+        "zip":             row[3],
+        "recorded_date":   row[4],
+        "sale_date":       row[5],
+        "status":          row[7],
+        "dk_status":       row[8],
+        "bexar_id":        row[9],
+        "owner_name":      row[10],
+        "mailing_address": row[11],
+        "appraised_value": row[12],
+        "last_sale_date":  row[13],
+        "property_type":   row[15],
+        "days_until_auction": row[16],
+        "cad_match":       row[17],
+    }
+
+
 def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
     row = build_row(address, recorded_date, sale_date, bexar_id, cad_data)
     sheet.append_row(row, value_input_option="USER_ENTERED")
@@ -490,6 +539,8 @@ def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
         f"{cad_data.get('owner_name', 'no owner')}"
     )
     time.sleep(2)
+    # ── Ping Zapier so the sheet→Podio Zap fires immediately ──
+    ping_zapier(row_to_webhook_payload(row))
 
 
 def reset_dead_row(sheet, row_index, address, recorded_date, sale_date,
@@ -501,6 +552,8 @@ def reset_dead_row(sheet, row_index, address, recorded_date, sale_date,
     street = row[0]
     log.info(f"  Reset DEAD row {row_index}: {street} | {recorded_date} | {bexar_id}")
     time.sleep(2)
+    # ── Ping Zapier for refiled DEAD leads ──
+    ping_zapier(row_to_webhook_payload(row))
 
 
 def update_dates_only(sheet, row_index, recorded_date, sale_date):
@@ -508,7 +561,6 @@ def update_dates_only(sheet, row_index, recorded_date, sale_date):
     time.sleep(1)
     sheet.update_cell(row_index, 6, sale_date)
     time.sleep(1)
-    # Refresh Days Until Auction (col Q = 17)
     dua = str(days_until_auction(sale_date))
     sheet.update_cell(row_index, 17, dua)
     time.sleep(1)
@@ -552,7 +604,6 @@ def expire_old_leads(sheet, existing):
             time.sleep(1)
             expired_count += 1
             log.info(f"  Expired (auction passed {auction_date}): {street}")
-            # Update the in-memory dict so refile logic sees it as DEAD
             data["dk_status"] = "DEAD"
 
     if expired_count:
@@ -699,7 +750,7 @@ def main():
 
                 # ── DUPLICATE ──────────────────────────────────────────
                 if row_data is not None:
-                    existing_rec    = row_data["recorded_date"]
+                    existing_rec     = row_data["recorded_date"]
                     existing_auction = row_data["auction_date"]
                     new_rec          = f["recorded_date"]
                     new_auction      = f["sale_date"]
@@ -719,7 +770,6 @@ def main():
                     )
 
                     if dk_status == "DEAD":
-                        # Full reset — run CAD lookup again for fresh data
                         cad_data = cad_lookup(cad_page, street)
 
                         if cad_data is None:
@@ -745,7 +795,6 @@ def main():
                         update_count += 1
 
                     else:
-                        # DK1 / DK2 / DK3 / DK4-10 → dates only
                         update_dates_only(sheet, row_index, new_rec, new_auction)
                         log_refile(refile_sheet, street, existing_rec, new_rec,
                                    existing_auction, new_auction, dk_status,
