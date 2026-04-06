@@ -1,19 +1,21 @@
 """
-Bexar County Foreclosure Scraper - v15
-Changes from v14:
-- Smarter duplicate handling:
-    Dates same            → skip entirely (no action)
-    Dates changed + DEAD  → reset row with fresh data, new BEXAR ID, logs to Refile Log
-    Dates changed + STATUS CHECK → update dates + reset DK Status to DK1 in sheet
-    Dates changed + DK1-DK10   → update dates only, logs to Refile Log
-- Refile Log: new "Refile Log" tab
-    Columns: Date Detected, Address, Old Recorded Date, New Recorded Date,
-             Old Auction Date, New Auction Date, DK Status, Action Taken
-- Auction date expiry: daily check — if auction date < today and not DEAD → mark DEAD
-- CAD Match flag: column R — YES if CAD found property, NO if not
-- Minimum appraised value filter: skip properties under $80k appraised
-- Days Until Auction: column Q — integer written at row creation time
-- Zapier webhook ping on new row append and DEAD row reset (triggers sheet→podio Zap)
+Bexar County Foreclosure Scraper - v17
+Changes from v16:
+- BatchData skip trace now also extracts email address + DNC flag
+- New BatchData Property Lookup call pulls equity %, AVM value, loan balance
+- Auto-calculates Potential (Sub-To / Wholesale / Both) based on equity:
+    Equity < 25%  → Sub-To
+    Equity 25-50% → Both
+    Equity > 50%  → Wholesale
+    Unknown       → blank (manual review)
+- New columns:
+    T: Email
+    U: Estimated Equity %
+    V: Estimated Value (AVM)
+    W: Loan Balance
+    X: Potential (Sub-To / Wholesale / Both)
+- All new fields included in Zapier webhook payload
+- New GitHub secret required: BATCHDATA_API_TOKEN (same key, already added)
 """
 
 import os
@@ -34,10 +36,11 @@ load_dotenv()
 CREDENTIALS_FILE   = os.environ["GOOGLE_SHEETS_CREDENTIALS"]
 SHEET_ID           = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJy2hP3ttlYJyWfK253eMvvtWQ5D0iLKo")
 ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL", "")
+BATCHDATA_TOKEN    = os.environ.get("BATCHDATA_API_TOKEN", "")
 SHEET_TAB          = "Sheet1"
 REFILE_TAB         = "Refile Log"
 MAX_DAYS_BACK      = 30
-MIN_APPRAISAL      = 80000   # Skip properties appraised below this value
+MIN_APPRAISAL      = 80000
 
 CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/?cid=110"
 
@@ -136,7 +139,6 @@ def generate_bexar_id(street, recorded_date):
 
 
 def days_until_auction(sale_date_str):
-    """Return integer days until auction, or empty string if unknown."""
     dt = parse_date(sale_date_str)
     if not dt:
         return ""
@@ -156,12 +158,299 @@ def goto_with_retry(page, url, retries=3, delay=5):
     return False
 
 
+def calc_potential(equity_pct_str):
+    """
+    Auto-classify lead as Sub-To, Wholesale, or Both based on equity %.
+    Returns empty string if equity unknown.
+    """
+    if not equity_pct_str:
+        return ""
+    try:
+        eq = float(str(equity_pct_str).replace("%", "").strip())
+        if eq < 25:
+            return "Sub-To"
+        elif eq > 50:
+            return "Wholesale"
+        else:
+            return "Both"
+    except Exception:
+        return ""
+
+
+# ─────────────────────────────────────────────
+# BatchData API helpers
+# ─────────────────────────────────────────────
+
+def _batchdata_post(endpoint, payload):
+    """Make a POST request to BatchData API. Returns parsed JSON or None."""
+    if not BATCHDATA_TOKEN:
+        log.warning("  BatchData: BATCHDATA_API_TOKEN not set — skipping")
+        return None
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://api.batchdata.com/api/v1/{endpoint}",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {BATCHDATA_TOKEN}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning(f"  BatchData API error ({endpoint}): {e}")
+        return None
+
+
+def skip_trace_address(street, city, state, zip_):
+    """
+    Call BatchData skip trace API.
+    Returns dict: { phone, email, dnc, owner_name, mailing_address }
+    owner_name and mailing_address are used as CAD fallback when CAD misses.
+    """
+    result = {"phone": "", "email": "", "dnc": "", "owner_name": "", "mailing_address": ""}
+
+    resp = _batchdata_post("property/skip-trace", {
+        "requests": [{
+            "propertyAddress": {
+                "street": street.title(),
+                "city":   city.title() if city else "San Antonio",
+                "state":  state or "TX",
+                "zip":    zip_ or "",
+            }
+        }]
+    })
+
+    if not resp:
+        return result
+
+    results = resp.get("results", [])
+    if not results:
+        log.info(f"  BatchData skip trace: no results for {street}")
+        return result
+
+    persons = results[0].get("personDetails", [])
+
+    mobile_phones  = []
+    other_phones   = []
+    emails         = []
+    dnc_flag       = False
+
+    for person in persons:
+        # ── Phones ──────────────────────────────────────────────────
+        for phone in person.get("phones", []):
+            number     = phone.get("number", "")
+            phone_type = phone.get("type", "").lower()
+            is_dnc     = phone.get("dnc", False) or phone.get("dncRegistered", False)
+
+            digits = re.sub(r"\D", "", number)
+            if len(digits) == 11 and digits.startswith("1"):
+                digits = digits[1:]
+            if len(digits) != 10:
+                continue
+
+            if is_dnc:
+                dnc_flag = True
+
+            if "mobile" in phone_type or "cell" in phone_type:
+                mobile_phones.append(digits)
+            else:
+                other_phones.append(digits)
+
+        # ── Emails ──────────────────────────────────────────────────
+        for email in person.get("emails", []):
+            addr = email.get("address", "") or email.get("email", "") or (
+                email if isinstance(email, str) else ""
+            )
+            if addr and "@" in addr:
+                emails.append(addr)
+
+    result["phone"] = mobile_phones[0] if mobile_phones else (
+                      other_phones[0]  if other_phones  else "")
+    result["email"] = emails[0] if emails else ""
+    result["dnc"]   = "YES" if dnc_flag else "NO"
+
+    # ── Owner name + mailing address from first person (CAD fallback) ──
+    if persons:
+        first      = persons[0]
+        first_name = first.get("firstName", "") or first.get("first_name", "")
+        last_name  = first.get("lastName",  "") or first.get("last_name",  "")
+        result["owner_name"] = f"{first_name} {last_name}".strip()
+
+        addresses = first.get("addresses", [])
+        if addresses:
+            a = addresses[0]
+            m_street = a.get("street", "") or a.get("streetAddress", "")
+            m_city   = a.get("city", "")
+            m_state  = a.get("state", "")
+            m_zip    = a.get("zip", "") or a.get("postalCode", "")
+            if m_street:
+                result["mailing_address"] = (
+                    f"{m_street}, {m_city}, {m_state} {m_zip}".strip(", ")
+                )
+
+    log.info(
+        f"  BatchData skip trace: {street} -> "
+        f"phone={result['phone'] or 'none'} | "
+        f"email={result['email'] or 'none'} | "
+        f"owner={result['owner_name'] or 'none'} | "
+        f"dnc={result['dnc']}"
+    )
+    return result
+
+
+def property_lookup(street, city, state, zip_):
+    """
+    Call BatchData Property Lookup API to get equity, AVM, loan balance.
+    Returns dict: { equity_pct, avm_value, loan_balance }
+    """
+    result = {"equity_pct": "", "avm_value": "", "loan_balance": ""}
+
+    resp = _batchdata_post("property/lookup", {
+        "requests": [{
+            "propertyAddress": {
+                "street": street.title(),
+                "city":   city.title() if city else "San Antonio",
+                "state":  state or "TX",
+                "zip":    zip_ or "",
+            }
+        }]
+    })
+
+    if not resp:
+        return result
+
+    results = resp.get("results", [])
+    if not results:
+        log.info(f"  BatchData property lookup: no results for {street}")
+        return result
+
+    prop = results[0]
+
+    # Navigate nested financial data — field names vary slightly by API version
+    # Try common paths BatchData uses
+    financial = (
+        prop.get("financial") or
+        prop.get("financialData") or
+        prop.get("mortgage") or
+        {}
+    )
+
+    valuation = (
+        prop.get("valuation") or
+        prop.get("avm") or
+        prop.get("value") or
+        {}
+    )
+
+    # Equity %
+    eq_pct = (
+        financial.get("equityPercent") or
+        financial.get("equity_percent") or
+        financial.get("estimatedEquityPercent") or
+        prop.get("equityPercent") or
+        prop.get("equity_percent") or
+        ""
+    )
+
+    # AVM value
+    avm = (
+        valuation.get("estimatedValue") or
+        valuation.get("value") or
+        valuation.get("avm") or
+        prop.get("estimatedValue") or
+        prop.get("avm") or
+        ""
+    )
+
+    # Loan balance
+    loan = (
+        financial.get("openLoanAmount") or
+        financial.get("loanBalance") or
+        financial.get("estimatedLoanBalance") or
+        financial.get("totalOpenLienAmount") or
+        prop.get("openLoanAmount") or
+        prop.get("loanBalance") or
+        ""
+    )
+
+    # Format values
+    if eq_pct:
+        try:
+            result["equity_pct"] = f"{round(float(eq_pct))}%"
+        except Exception:
+            result["equity_pct"] = str(eq_pct)
+
+    if avm:
+        try:
+            result["avm_value"] = f"${int(float(avm)):,}"
+        except Exception:
+            result["avm_value"] = str(avm)
+
+    if loan:
+        try:
+            result["loan_balance"] = f"${int(float(loan)):,}"
+        except Exception:
+            result["loan_balance"] = str(loan)
+
+    # Last sale date (CAD fallback)
+    sale_history = (
+        prop.get("saleHistory") or
+        prop.get("lastSale") or
+        prop.get("transactionHistory") or
+        []
+    )
+    if isinstance(sale_history, list) and sale_history:
+        last = sale_history[0]
+        sale_date_raw = (
+            last.get("saleDate") or last.get("recordingDate") or
+            last.get("date") or ""
+        )
+        if sale_date_raw:
+            try:
+                # Normalize to MM/DD/YYYY
+                from datetime import datetime as _dt
+                for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y%m%d"):
+                    try:
+                        result["last_sale_date"] = _dt.strptime(
+                            str(sale_date_raw)[:10], fmt
+                        ).strftime("%m/%d/%Y")
+                        break
+                    except Exception:
+                        pass
+            except Exception:
+                result["last_sale_date"] = str(sale_date_raw)
+
+    # Appraised/assessed value (CAD fallback)
+    assessed = (
+        prop.get("assessedValue") or
+        prop.get("taxAssessedValue") or
+        financial.get("assessedValue") or
+        ""
+    )
+    if assessed:
+        try:
+            result["appraised_value"] = f"${int(float(assessed)):,}"
+        except Exception:
+            result["appraised_value"] = str(assessed)
+
+    log.info(
+        f"  BatchData property lookup: {street} -> "
+        f"equity={result['equity_pct'] or 'n/a'} | "
+        f"avm={result['avm_value'] or 'n/a'} | "
+        f"loan={result['loan_balance'] or 'n/a'} | "
+        f"last_sale={result['last_sale_date'] or 'n/a'}"
+    )
+    return result
+
+
 # ─────────────────────────────────────────────
 # Zapier webhook ping
 # ─────────────────────────────────────────────
 
 def ping_zapier(row_data: dict):
-    """POST row data to Zapier webhook to trigger the sheet→Podio Zap."""
     if not ZAPIER_WEBHOOK_URL:
         log.warning("  ZAPIER_WEBHOOK_URL not set — skipping webhook ping")
         return
@@ -187,8 +476,8 @@ def ping_zapier(row_data: dict):
 def cad_lookup(page, street):
     """
     Returns dict with CAD data if found and passes all filters.
-    Returns None  → skip this lead (LLC / non-SF / below min appraisal)
-    Returns {}    → no CAD match found, proceed with empty data
+    Returns None → skip this lead (LLC / non-SF / below min appraisal)
+    Returns {}   → no CAD match found, proceed with empty data
     """
     search_term = strip_street_suffix(street)
     if not search_term:
@@ -294,7 +583,6 @@ def cad_lookup(page, street):
             log.info(f"  CAD: No address match for house number {house_num}")
             return {}
 
-        # ── Minimum appraised value filter ──────────────────────────────
         if result_appraised:
             try:
                 appr_num = float(re.sub(r"[^\d.]", "", result_appraised))
@@ -307,7 +595,6 @@ def cad_lookup(page, street):
             except Exception:
                 pass
 
-        # ── Click View Details ───────────────────────────────────────────
         detail_link = matched_row.locator("a:has-text('View Details')")
         if detail_link.count() == 0:
             log.warning("  CAD: No View Details link found")
@@ -320,7 +607,6 @@ def cad_lookup(page, street):
         detail_text = page.locator("body").inner_text()
         owner_name  = result_owner_name
 
-        # ── Mailing address ──────────────────────────────────────────────
         mailing_address = ""
         mail_block = re.search(
             r"Mailing Address:(.*?)(?:Exemptions:|\Z)", detail_text, re.DOTALL
@@ -345,7 +631,6 @@ def cad_lookup(page, street):
 
         appraised_value = result_appraised
 
-        # ── Last sale date ───────────────────────────────────────────────
         last_sale_date = ""
         try:
             for selector in ["text=Deed History", "text=Deed History - (Last 3"]:
@@ -373,7 +658,6 @@ def cad_lookup(page, street):
         except Exception as de:
             log.warning(f"  CAD: deed date extraction failed: {de}")
 
-        # ── Property type — SF filter ────────────────────────────────────
         property_type = ""
         prop_match = re.search(r"Property Use Description:\s*([^\n]+)", detail_text)
         if prop_match:
@@ -434,15 +718,9 @@ def get_refile_log(wb):
 
 
 def get_existing_data(sheet):
-    """
-    Returns:
-      existing: dict keyed by street_upper →
-        { row_index, dk_status, recorded_date, auction_date }
-      most_recent_date: datetime of most recent recorded date
-    """
-    rows = sheet.get_all_values()
-    existing      = {}
-    all_dates     = []
+    rows      = sheet.get_all_values()
+    existing  = {}
+    all_dates = []
 
     for i, row in enumerate(rows[1:], start=2):
         street = row[0].strip().upper() if len(row) > 0 else ""
@@ -450,11 +728,11 @@ def get_existing_data(sheet):
             continue
         recorded_date = row[4].strip() if len(row) > 4 else ""
         auction_date  = row[5].strip() if len(row) > 5 else ""
-        dk_status     = row[8].strip().upper() if len(row) > 8 else ""  # col I
+        dk_status     = row[8].strip().upper() if len(row) > 8 else ""
 
         existing[street] = {
-            "row_index":    i,
-            "dk_status":    dk_status,
+            "row_index":     i,
+            "dk_status":     dk_status,
             "recorded_date": recorded_date,
             "auction_date":  auction_date,
         }
@@ -471,21 +749,19 @@ def log_refile(refile_sheet, address, old_rec, new_rec,
                old_auction, new_auction, dk_status, action):
     refile_sheet.append_row([
         datetime.now().strftime("%m/%d/%Y"),
-        address,
-        old_rec,
-        new_rec,
-        old_auction,
-        new_auction,
-        dk_status,
-        action,
+        address, old_rec, new_rec,
+        old_auction, new_auction, dk_status, action,
     ])
     time.sleep(1)
 
 
-def build_row(address, recorded_date, sale_date, bexar_id, cad_data):
-    """Build the 18-column row list (A through R)."""
+def build_row(address, recorded_date, sale_date, bexar_id, cad_data,
+              phone="", email="", equity_pct="", avm_value="", loan_balance=""):
+    """Build the 24-column row list (A through X)."""
     street, city, state, zip_ = parse_address(address)
     cad_match = "YES" if cad_data.get("owner_name") else "NO"
+    potential = calc_potential(equity_pct)
+
     return [
         street,                               # A
         city,                                 # B
@@ -495,7 +771,7 @@ def build_row(address, recorded_date, sale_date, bexar_id, cad_data):
         sale_date,                            # F
         "",                                   # G
         "Active",                             # H
-        "",                                   # I  DK Status (blank = new)
+        "",                                   # I  DK Status
         bexar_id,                             # J
         cad_data.get("owner_name", ""),       # K
         cad_data.get("mailing_address", ""),  # L
@@ -505,54 +781,65 @@ def build_row(address, recorded_date, sale_date, bexar_id, cad_data):
         cad_data.get("property_type", ""),    # P
         str(days_until_auction(sale_date)),   # Q  Days Until Auction
         cad_match,                            # R  CAD Match
+        phone,                                # S  Seller Phone
+        email,                                # T  Seller Email
+        equity_pct,                           # U  Estimated Equity %
+        avm_value,                            # V  Estimated Value (AVM)
+        loan_balance,                         # W  Loan Balance
+        potential,                            # X  Potential (Sub-To/Wholesale/Both)
     ]
 
 
 def row_to_webhook_payload(row):
-    """Map the 18-column row list to named fields for the Zapier webhook."""
     return {
-        "street":          row[0],
-        "city":            row[1],
-        "state":           row[2],
-        "zip":             row[3],
-        "recorded_date":   row[4],
-        "sale_date":       row[5],
-        "status":          row[7],
-        "dk_status":       row[8],
-        "bexar_id":        row[9],
-        "owner_name":      row[10],
-        "mailing_address": row[11],
-        "appraised_value": row[12],
-        "last_sale_date":  row[13],
-        "property_type":   row[15],
+        "street":            row[0],
+        "city":              row[1],
+        "state":             row[2],
+        "zip":               row[3],
+        "recorded_date":     row[4],
+        "sale_date":         row[5],
+        "status":            row[7],
+        "dk_status":         row[8],
+        "bexar_id":          row[9],
+        "owner_name":        row[10],
+        "mailing_address":   row[11],
+        "appraised_value":   row[12],
+        "last_sale_date":    row[13],
+        "property_type":     row[15],
         "days_until_auction": row[16],
-        "cad_match":       row[17],
+        "cad_match":         row[17],
+        "seller_phone":      row[18],
+        "seller_email":      row[19],
+        "equity_pct":        row[20],
+        "avm_value":         row[21],
+        "loan_balance":      row[22],
+        "potential":         row[23],
     }
 
 
-def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data):
-    row = build_row(address, recorded_date, sale_date, bexar_id, cad_data)
+def append_row(sheet, address, recorded_date, sale_date, bexar_id, cad_data,
+               phone="", email="", equity_pct="", avm_value="", loan_balance=""):
+    row = build_row(address, recorded_date, sale_date, bexar_id, cad_data,
+                    phone, email, equity_pct, avm_value, loan_balance)
     sheet.append_row(row, value_input_option="USER_ENTERED")
-    street = row[0]
     log.info(
-        f"  New row: {street} | {recorded_date} | {bexar_id} | "
-        f"{cad_data.get('owner_name', 'no owner')}"
+        f"  New row: {row[0]} | {recorded_date} | {row[9]} | "
+        f"owner={row[10] or 'none'} | phone={phone or 'none'} | "
+        f"equity={equity_pct or 'n/a'} | potential={row[23] or 'unknown'}"
     )
     time.sleep(2)
-    # ── Ping Zapier so the sheet→Podio Zap fires immediately ──
     ping_zapier(row_to_webhook_payload(row))
 
 
 def reset_dead_row(sheet, row_index, address, recorded_date, sale_date,
-                   bexar_id, cad_data):
-    """Overwrite an existing DEAD row with fresh lead data."""
-    row = build_row(address, recorded_date, sale_date, bexar_id, cad_data)
-    cell_range = f"A{row_index}:R{row_index}"
+                   bexar_id, cad_data, phone="", email="",
+                   equity_pct="", avm_value="", loan_balance=""):
+    row = build_row(address, recorded_date, sale_date, bexar_id, cad_data,
+                    phone, email, equity_pct, avm_value, loan_balance)
+    cell_range = f"A{row_index}:X{row_index}"
     sheet.update(cell_range, [row], value_input_option="USER_ENTERED")
-    street = row[0]
-    log.info(f"  Reset DEAD row {row_index}: {street} | {recorded_date} | {bexar_id}")
+    log.info(f"  Reset DEAD row {row_index}: {row[0]} | {recorded_date} | {row[9]}")
     time.sleep(2)
-    # ── Ping Zapier for refiled DEAD leads ──
     ping_zapier(row_to_webhook_payload(row))
 
 
@@ -568,15 +855,14 @@ def update_dates_only(sheet, row_index, recorded_date, sale_date):
 
 
 def update_dates_and_reset_dk(sheet, row_index, recorded_date, sale_date):
-    """For STATUS CHECK refilers: update dates AND reset DK status to DK1."""
-    sheet.update_cell(row_index, 5, recorded_date)   # E
+    sheet.update_cell(row_index, 5, recorded_date)
     time.sleep(1)
-    sheet.update_cell(row_index, 6, sale_date)        # F
+    sheet.update_cell(row_index, 6, sale_date)
     time.sleep(1)
-    sheet.update_cell(row_index, 9, "DK1")            # I
+    sheet.update_cell(row_index, 9, "DK1")
     time.sleep(1)
     dua = str(days_until_auction(sale_date))
-    sheet.update_cell(row_index, 17, dua)             # Q
+    sheet.update_cell(row_index, 17, dua)
     time.sleep(1)
     log.info(f"  Updated dates + reset DK1 row {row_index}: {recorded_date} / {sale_date}")
 
@@ -586,7 +872,6 @@ def update_dates_and_reset_dk(sheet, row_index, recorded_date, sale_date):
 # ─────────────────────────────────────────────
 
 def expire_old_leads(sheet, existing):
-    """Mark DEAD any lead whose auction date has already passed."""
     today         = datetime.now().date()
     expired_count = 0
 
@@ -600,7 +885,7 @@ def expire_old_leads(sheet, existing):
 
         auction_dt = parse_date(auction_date)
         if auction_dt and auction_dt.date() < today:
-            sheet.update_cell(row_index, 9, "DEAD")   # col I
+            sheet.update_cell(row_index, 9, "DEAD")
             time.sleep(1)
             expired_count += 1
             log.info(f"  Expired (auction passed {auction_date}): {street}")
@@ -710,7 +995,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v15")
+    log.info("Bexar County Foreclosure Scraper v17")
     log.info("=" * 60)
 
     try:
@@ -724,10 +1009,8 @@ def main():
             f"Most recent date: {most_recent.strftime('%m/%d/%Y') if most_recent else 'none'}"
         )
 
-        # ── Step 1: expire leads whose auction date has passed ─────────
         expired = expire_old_leads(sheet, existing)
 
-        # ── Step 2: scrape county site ──────────────────────────────────
         foreclosures = scrape_foreclosures(most_recent)
         log.info(f"Records to process: {len(foreclosures)}")
 
@@ -741,7 +1024,7 @@ def main():
             cad_page = context.new_page()
 
             for f in foreclosures:
-                street, _, _, _ = parse_address(f["address"])
+                street, city, state, zip_ = parse_address(f["address"])
                 key = street.strip().upper()
                 if not key:
                     continue
@@ -757,12 +1040,10 @@ def main():
                     dk_status        = row_data["dk_status"]
                     row_index        = row_data["row_index"]
 
-                    # A: Dates unchanged → skip entirely
                     if existing_rec == new_rec and existing_auction == new_auction:
                         log.info(f"  Skip (same dates): {street}")
                         continue
 
-                    # C: Dates changed — true refile
                     log.info(
                         f"  Refile detected: {street} | "
                         f"auction {existing_auction} → {new_auction} | "
@@ -779,9 +1060,27 @@ def main():
                                        "Kept DEAD — LLC/non-SF/below min value")
                             skipped += 1
                         else:
+                            st_data  = skip_trace_address(street, city, state, zip_)
+                            pl_data  = property_lookup(street, city, state, zip_)
+                            # Fill CAD miss from BatchData for refiled DEAD leads too
+                            if cad_data == {}:
+                                cad_data = {
+                                    "owner_name":      st_data.get("owner_name", ""),
+                                    "mailing_address": st_data.get("mailing_address", ""),
+                                    "appraised_value": pl_data.get("appraised_value", ""),
+                                    "last_sale_date":  pl_data.get("last_sale_date", ""),
+                                    "property_type":   "",
+                                }
                             bexar_id = generate_bexar_id(street, new_rec)
-                            reset_dead_row(sheet, row_index, f["address"],
-                                           new_rec, new_auction, bexar_id, cad_data or {})
+                            reset_dead_row(
+                                sheet, row_index, f["address"],
+                                new_rec, new_auction, bexar_id, cad_data,
+                                phone=st_data["phone"],
+                                email=st_data["email"],
+                                equity_pct=pl_data["equity_pct"],
+                                avm_value=pl_data["avm_value"],
+                                loan_balance=pl_data["loan_balance"],
+                            )
                             log_refile(refile_sheet, street, existing_rec, new_rec,
                                        existing_auction, new_auction, dk_status,
                                        "Reset row — was DEAD, refiled as new lead")
@@ -811,9 +1110,32 @@ def main():
                         time.sleep(1)
                         continue
 
+                    # ── BatchData enrichment (always runs) ────────────
+                    st_data = skip_trace_address(street, city, state, zip_)
+                    pl_data = property_lookup(street, city, state, zip_)
+
+                    # ── If CAD missed, fill blanks from BatchData ──────
+                    # cad_data == {} means CAD found nothing (not skipped)
+                    if cad_data == {}:
+                        log.info(f"  CAD miss — filling from BatchData: {street}")
+                        cad_data = {
+                            "owner_name":      st_data.get("owner_name", ""),
+                            "mailing_address": st_data.get("mailing_address", ""),
+                            "appraised_value": pl_data.get("appraised_value", ""),
+                            "last_sale_date":  pl_data.get("last_sale_date", ""),
+                            "property_type":   "",
+                        }
+
                     bexar_id = generate_bexar_id(street, f["recorded_date"])
-                    append_row(sheet, f["address"], f["recorded_date"],
-                               f["sale_date"], bexar_id, cad_data or {})
+                    append_row(
+                        sheet, f["address"], f["recorded_date"],
+                        f["sale_date"], bexar_id, cad_data,
+                        phone=st_data["phone"],
+                        email=st_data["email"],
+                        equity_pct=pl_data["equity_pct"],
+                        avm_value=pl_data["avm_value"],
+                        loan_balance=pl_data["loan_balance"],
+                    )
                     new_count += 1
 
                 time.sleep(2)
