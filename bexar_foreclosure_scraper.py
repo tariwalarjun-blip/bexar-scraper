@@ -193,7 +193,7 @@ def _batchdata_post(endpoint, payload):
             data=data,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {BATCHDATA_TOKEN}",
+                "X-API-Key": BATCHDATA_TOKEN,
             },
             method="POST",
         )
@@ -308,15 +308,15 @@ def property_lookup(street, city, state, zip_):
     """
     result = {"equity_pct": "", "avm_value": "", "loan_balance": ""}
 
-    resp = _batchdata_post("property/lookup", {
-        "requests": [{
+    resp = _batchdata_post("property/search", {
+        "data": {
             "propertyAddress": {
                 "street": street.title(),
                 "city":   city.title() if city else "San Antonio",
                 "state":  state or "TX",
                 "zip":    zip_ or "",
             }
-        }]
+        }
     })
 
     if not resp:
