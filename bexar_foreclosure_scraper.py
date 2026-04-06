@@ -215,10 +215,10 @@ def skip_trace_address(street, city, state, zip_):
     resp = _batchdata_post("property/skip-trace", {
         "requests": [{
             "propertyAddress": {
-                "street": street.title(),
-                "city":   city.title() if city else "San Antonio",
-                "state":  state or "TX",
-                "zip":    zip_ or "",
+                "address": street.title(),
+                "city":    city.title() if city else "San Antonio",
+                "state":   state or "TX",
+                "zip":     zip_ or "",
             }
         }]
     })
@@ -309,14 +309,14 @@ def property_lookup(street, city, state, zip_):
     result = {"equity_pct": "", "avm_value": "", "loan_balance": ""}
 
     resp = _batchdata_post("property/search", {
-        "data": {
+        "requests": [{
             "propertyAddress": {
-                "street": street.title(),
-                "city":   city.title() if city else "San Antonio",
-                "state":  state or "TX",
-                "zip":    zip_ or "",
+                "address": street.title(),
+                "city":    city.title() if city else "San Antonio",
+                "state":   state or "TX",
+                "zip":     zip_ or "",
             }
-        }
+        }]
     })
 
     if not resp:
@@ -921,8 +921,12 @@ def scrape_foreclosures(most_recent_date):
     results     = []
     done        = False
     hard_cutoff = datetime.now() - timedelta(days=MAX_DAYS_BACK)
-    stop_date   = max(most_recent_date, hard_cutoff) if most_recent_date else hard_cutoff
-    log.info(f"Stop date: {stop_date.strftime('%m/%d/%Y')}")
+    # Subtract 1 day so scraper re-checks the most recent recorded date
+    # in case new filings were added after the last run
+    if most_recent_date:
+        most_recent_date = most_recent_date - timedelta(days=1)
+    stop_date = max(most_recent_date, hard_cutoff) if most_recent_date else hard_cutoff
+    log.info(f"Stop date: {stop_date.strftime('%m/%d/%Y')} (1 day lookback applied)")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
