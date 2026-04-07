@@ -1,17 +1,14 @@
 """
-Trustee Lookup - v1
+Trustee Lookup - v2
+Changes from v1:
+- Replaced canvas screenshot approach with network image interception
+- The doc viewer fetches page images as real HTTP image responses
+- We intercept those responses directly instead of screenshotting a canvas
+- Fallback to full page screenshot if no images intercepted
+
 Reads Doc Number (column Y) from Sheet1.
-For each row where Substitute Trustee (column G) is blank or "Unknown",
-opens bexar.tx.publicsearch.us/doc/{DOC_NUMBER}, screenshots all canvas
-pages, sends to Claude Vision API, extracts trustee name, writes back to
-column G.
-
-Run on schedule (GitHub Actions every 30 min) AFTER the main scraper runs.
-
-Required env vars (same as scraper):
-  GOOGLE_SHEETS_CREDENTIALS
-  SHEET_ID
-  ANTHROPIC_API_KEY
+For each row where Substitute Trustee (column G) is blank or 'Unknown',
+extracts trustee using Claude Vision and writes back to column G.
 """
 
 import os
@@ -33,9 +30,8 @@ SHEET_ID         = os.environ.get("SHEET_ID", "1Z9l13Z62LuTJy2hP3ttlYJyWfK253eMv
 ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
 SHEET_TAB        = "Sheet1"
 
-# Column indices (1-based for gspread update_cell)
-COL_TRUSTEE   = 7   # G
-COL_DOC_NUM   = 25  # Y
+COL_TRUSTEE = 7   # G
+COL_DOC_NUM = 25  # Y
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,43 +55,25 @@ def get_sheet():
 
 
 def get_pending_rows(sheet):
-    """
-    Returns list of dicts for rows where:
-    - Column Y (Doc Number) is filled
-    - Column G (Substitute Trustee) is blank or 'Unknown'
-    """
     rows    = sheet.get_all_values()
     pending = []
-
-    for i, row in enumerate(rows[1:], start=2):  # skip header
-        trustee  = row[COL_TRUSTEE - 1].strip() if len(row) >= COL_TRUSTEE else ""
-        doc_num  = row[COL_DOC_NUM - 1].strip()  if len(row) >= COL_DOC_NUM else ""
-        address  = row[0].strip()                if len(row) > 0            else ""
-
+    for i, row in enumerate(rows[1:], start=2):
+        trustee = row[COL_TRUSTEE - 1].strip() if len(row) >= COL_TRUSTEE else ""
+        doc_num = row[COL_DOC_NUM - 1].strip()  if len(row) >= COL_DOC_NUM else ""
+        address = row[0].strip()                if len(row) > 0            else ""
         if not doc_num:
-            continue  # no doc number yet, scraper hasn't stored it
-
+            continue
         if trustee and trustee.lower() != "unknown":
-            continue  # already have a trustee
-
-        pending.append({
-            "row_index": i,
-            "address":   address,
-            "doc_number": doc_num,
-        })
-
+            continue
+        pending.append({"row_index": i, "address": address, "doc_number": doc_num})
     return pending
 
 
 # ─────────────────────────────────────────────
-# Claude Vision — extract trustee from screenshots
+# Claude Vision
 # ─────────────────────────────────────────────
 
 def extract_trustee(images: list, client: anthropic.Anthropic) -> str:
-    """
-    Send 1 or more page screenshots to Claude Vision.
-    Returns trustee name string, or 'Unknown'.
-    """
     content = []
     for img_bytes in images:
         b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
@@ -103,19 +81,17 @@ def extract_trustee(images: list, client: anthropic.Anthropic) -> str:
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": b64},
         })
-
     content.append({
         "type": "text",
         "text": (
             f"These are {len(images)} page(s) of a Texas Notice of Foreclosure Sale document. "
             "Find the Substitute Trustee or Trustee name. "
-            "It usually appears near the bottom of the document near a signature block "
+            "It usually appears near the bottom near a signature block "
             "with the word 'Trustee' printed below a name or company. "
             "Return ONLY the trustee name or company name, nothing else. "
             "If you cannot find it, return exactly: Unknown"
         ),
     })
-
     resp = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=200,
@@ -127,86 +103,87 @@ def extract_trustee(images: list, client: anthropic.Anthropic) -> str:
 
 
 # ─────────────────────────────────────────────
-# Playwright — screenshot canvas pages
+# Playwright — intercept image responses
 # ─────────────────────────────────────────────
 
-def get_best_canvas_screenshot(page):
-    """Return screenshot bytes of the largest canvas on the page, or None."""
-    canvases = page.locator("canvas").all()
-    best      = None
-    best_size = 0
-    for c in canvases:
-        try:
-            box = c.bounding_box()
-            if box:
-                size = box["width"] * box["height"]
-                if size > best_size:
-                    best_size = size
-                    best      = c
-        except Exception:
-            pass
-    if best and best_size > 5000:
-        return best.screenshot()
-    return None
-
-
-def screenshot_doc_pages(page, doc_number: str) -> list:
+def fetch_doc_images(context, doc_number: str) -> list:
     """
-    Navigate to the doc viewer, screenshot every page, return list of image bytes.
+    Open the doc viewer, intercept image HTTP responses, download each one.
+    Falls back to full page screenshot if nothing intercepted.
     """
     url = f"https://bexar.tx.publicsearch.us/doc/{doc_number}"
     log.info(f"  Opening: {url}")
+
+    captured_urls = []
+    captured_bytes = {}
+
+    page = context.new_page()
+
+    def on_response(response):
+        resp_url = response.url
+        ct = response.headers.get("content-type", "")
+        if "image" in ct and resp_url not in captured_urls:
+            # Filter out tiny UI icons (favicons etc)
+            captured_urls.append(resp_url)
+
+    page.on("response", on_response)
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         log.warning(f"  Page load failed: {e}")
+        page.close()
         return []
 
-    time.sleep(6)  # wait for canvas to render
-
-    # Detect total pages
-    total_pages = 1
-    try:
-        pages_text = page.locator("text=/of \\d+/").first.inner_text(timeout=3000)
-        m = re.search(r"of (\d+)", pages_text)
-        if m:
-            total_pages = int(m.group(1))
-    except Exception:
-        pass
-    log.info(f"  Total pages: {total_pages}")
+    # Wait longer for the viewer to fetch page images
+    time.sleep(10)
 
     images = []
-    for pg in range(1, total_pages + 1):
-        img = get_best_canvas_screenshot(page)
-        if img:
-            images.append(img)
-            log.info(f"  Captured page {pg}/{total_pages}")
-        else:
-            log.warning(f"  No canvas found on page {pg}")
 
-        if pg < total_pages:
-            # Click next page button
-            clicked = False
-            for selector in [
-                "button[aria-label='Next Page']",
-                "[title='Next Page']",
-                "button:has-text('›')",
-                "button:has-text('>')",
-            ]:
-                try:
-                    btn = page.locator(selector).first
-                    if btn.count() > 0:
-                        btn.click()
-                        time.sleep(4)
-                        clicked = True
-                        break
-                except Exception:
-                    pass
-            if not clicked:
-                log.warning(f"  Could not click to next page after page {pg}")
-                break
+    # Filter to only substantive images (skip tiny icons < 5KB)
+    doc_image_urls = [
+        u for u in captured_urls
+        if any(x in u.lower() for x in ["page", "render", "image", "doc", "tiff", "jpg", "png"])
+        and "favicon" not in u.lower()
+        and "logo" not in u.lower()
+    ]
 
+    log.info(f"  Intercepted {len(captured_urls)} images, {len(doc_image_urls)} look like doc pages")
+
+    if doc_image_urls:
+        for img_url in doc_image_urls:
+            try:
+                img_page = context.new_page()
+                img_page.goto(img_url, wait_until="domcontentloaded", timeout=15000)
+                time.sleep(1)
+                img_bytes = img_page.screenshot(full_page=True)
+                img_page.close()
+                images.append(img_bytes)
+                log.info(f"  Captured image from: {img_url}")
+            except Exception as e:
+                log.warning(f"  Could not fetch {img_url}: {e}")
+    elif captured_urls:
+        # Use whatever images were intercepted
+        for img_url in captured_urls[:5]:  # cap at 5
+            try:
+                img_page = context.new_page()
+                img_page.goto(img_url, wait_until="domcontentloaded", timeout=15000)
+                time.sleep(1)
+                img_bytes = img_page.screenshot(full_page=True)
+                img_page.close()
+                images.append(img_bytes)
+            except Exception as e:
+                log.warning(f"  Could not fetch {img_url}: {e}")
+    else:
+        # Last resort: screenshot the full page
+        log.warning("  No images intercepted — using full page screenshot")
+        try:
+            img_bytes = page.screenshot(full_page=True)
+            images.append(img_bytes)
+        except Exception as e:
+            log.warning(f"  Full page screenshot failed: {e}")
+
+    page.close()
     return images
 
 
@@ -216,7 +193,7 @@ def screenshot_doc_pages(page, doc_number: str) -> list:
 
 def main():
     log.info("=" * 60)
-    log.info("Trustee Lookup v1")
+    log.info("Trustee Lookup v2")
     log.info("=" * 60)
 
     sheet   = get_sheet()
@@ -236,7 +213,6 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport={"width": 1280, "height": 900})
-        page    = context.new_page()
 
         for record in pending:
             row_index  = record["row_index"]
@@ -246,10 +222,10 @@ def main():
             log.info(f"Row {row_index}: {address} — doc {doc_number}")
 
             try:
-                images = screenshot_doc_pages(page, doc_number)
+                images = fetch_doc_images(context, doc_number)
 
                 if not images:
-                    log.warning(f"  No images captured for {doc_number} — writing Unknown")
+                    log.warning(f"  No images captured — writing Unknown")
                     sheet.update_cell(row_index, COL_TRUSTEE, "Unknown")
                     unknown += 1
                 else:
@@ -265,7 +241,7 @@ def main():
                 log.error(f"  Error on row {row_index} ({address}): {e}")
                 errors += 1
 
-            time.sleep(3)  # be polite between doc requests
+            time.sleep(3)
 
         browser.close()
 
