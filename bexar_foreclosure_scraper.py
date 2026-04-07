@@ -927,15 +927,21 @@ def scrape_foreclosures(most_recent_date):
                         done = True
                         break
 
-                    # ── NEW: grab DOC NUMBER ──────────────────────────
-                    # The results page columns are:
-                    # [checkbox, expand, DOC TYPE, RECORDED DATE, SALE DATE, DOC NUMBER, REMARKS, PROPERTY ADDRESS]
-                    # Doc number is an 11-digit numeric string like 20260500129
+                    # ── Grab the internal doc URL ID from the row link ──
+                    # The DOC NUMBER column text (e.g. 20260500137) is NOT the URL ID.
+                    # The actual doc URL uses a different internal ID (e.g. 314212563).
+                    # We grab it from the href of the clickable link in the row.
                     doc_number = ""
-                    for val in cell_text:
-                        if re.match(r"^\d{8,}$", val.strip()):
-                            doc_number = val.strip()
-                            break
+                    try:
+                        links = row.locator("a").all()
+                        for link in links:
+                            href = link.get_attribute("href") or ""
+                            m = re.search(r"/doc/(\d+)", href)
+                            if m:
+                                doc_number = m.group(1)
+                                break
+                    except Exception:
+                        pass
                     # ─────────────────────────────────────────────────
 
                     address = ""
@@ -952,7 +958,7 @@ def scrape_foreclosures(most_recent_date):
                             "doc_number":    doc_number,   # ← NEW
                         })
                         if doc_number:
-                            log.info(f"  Captured doc: {doc_number} → {address}")
+                            log.info(f"  Captured doc URL ID: {doc_number} → {address}")
 
                 except Exception as e:
                     log.warning(f"  Row error: {e}")
