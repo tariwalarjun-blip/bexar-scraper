@@ -832,36 +832,6 @@ def update_dates_and_reset_dk(sheet, row_index, recorded_date, sale_date):
 
 
 # ─────────────────────────────────────────────
-# Auction date expiry check  (unchanged)
-# ─────────────────────────────────────────────
-
-def expire_old_leads(sheet, existing):
-    today         = datetime.now().date()
-    expired_count = 0
-
-    for street, data in existing.items():
-        auction_date = data.get("auction_date", "")
-        dk_status    = data.get("dk_status", "")
-        row_index    = data["row_index"]
-
-        if not auction_date or dk_status == "DEAD":
-            continue
-
-        auction_dt = parse_date(auction_date)
-        if auction_dt and auction_dt.date() < today:
-            sheet.update_cell(row_index, 9, "DEAD")
-            time.sleep(1)
-            expired_count += 1
-            log.info(f"  Expired (auction passed {auction_date}): {street}")
-            data["dk_status"] = "DEAD"
-
-    if expired_count:
-        log.info(f"  Marked {expired_count} lead(s) DEAD — auction date passed")
-
-    return expired_count
-
-
-# ─────────────────────────────────────────────
 # Foreclosure scraper
 # ─────────────────────────────────────────────
 
@@ -997,8 +967,6 @@ def main():
             f"Most recent date: {most_recent.strftime('%m/%d/%Y') if most_recent else 'none'}"
         )
 
-        expired = expire_old_leads(sheet, existing)
-
         foreclosures = scrape_foreclosures(most_recent)
         log.info(f"Records to process: {len(foreclosures)}")
 
@@ -1131,8 +1099,7 @@ def main():
 
         log.info("=" * 60)
         log.info(
-            f"Done. {new_count} new | {update_count} refiled | "
-            f"{skipped} skipped | {expired} expired"
+            f"Done. {new_count} new | {update_count} refiled | {skipped} skipped"
         )
         log.info("=" * 60)
 
