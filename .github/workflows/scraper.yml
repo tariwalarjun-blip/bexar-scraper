@@ -1,5 +1,4 @@
 name: Bexar Foreclosure Scraper
-
 on:
   schedule:
     - cron: '0 13 * * *'  # Runs daily at 1:00pm UTC
@@ -8,7 +7,6 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -16,22 +14,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Point apt at main Ubuntu mirror
-        run: |
-          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          sudo apt-get update
       - name: Install dependencies
-        timeout-minutes: 10
         run: |
           pip install -r requirements.txt
           playwright install chromium
-          for i in 1 2 3; do
-            if playwright install-deps chromium; then exit 0; fi
-            echo "Attempt $i failed, retrying in 20s..."
-            sleep 20
-            sudo apt-get update || true
-          done
-          exit 1
+          playwright install-deps chromium
       - name: Write credentials file
         env:
           CREDS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
@@ -49,7 +36,6 @@ jobs:
 
   trustee_lookup:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
     needs: scrape  # Always runs right after scrape finishes — manual or scheduled
     steps:
       - name: Checkout repo
@@ -58,22 +44,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Point apt at main Ubuntu mirror
-        run: |
-          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          sudo apt-get update
       - name: Install dependencies
-        timeout-minutes: 10
         run: |
           pip install -r requirements.txt
           playwright install chromium
-          for i in 1 2 3; do
-            if playwright install-deps chromium; then exit 0; fi
-            echo "Attempt $i failed, retrying in 20s..."
-            sleep 20
-            sudo apt-get update || true
-          done
-          exit 1
+          playwright install-deps chromium
       - name: Write credentials file
         env:
           CREDS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
