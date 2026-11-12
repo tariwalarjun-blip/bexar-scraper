@@ -1,5 +1,11 @@
 """
-Bexar County Foreclosure Scraper - v19
+Bexar County Foreclosure Scraper - v20
+Changes from v19:
+- Page 2+ now advances by clicking the site's Next button (same session as page 1)
+  and only falls back to loading the offset URL if the click fails
+- Logs any HTTP 4xx/5xx from publicsearch.us background requests (shows blocks)
+- Logs button labels on the page if the Next button can't be found
+
 Changes from v18:
 - scrape_page_with_retry now logs URL, title, tr count, first 500 chars of body,
   and saves a screenshot (debug_page{N}_attempt{M}.png) when 0 data rows come back
@@ -883,6 +889,57 @@ def scrape_page_with_retry(page, url, max_retries=3, page_num=1):
     return []
 
 
+def click_next_page(page):
+    """
+    Advance to the next results page by clicking the Next button, like a human.
+    Returns the new rows, or [] if it couldn't advance.
+    """
+    def get_data_rows():
+        rows = page.locator("table tbody tr").all()
+        return [r for r in rows if re.search(r"\d{1,2}/\d{1,2}/\d{4}", r.inner_text())]
+
+    try:
+        prev_first = get_data_rows()[0].inner_text()
+    except Exception:
+        prev_first = ""
+
+    selectors = [
+        "button[aria-label*='next' i]",
+        "a[aria-label*='next' i]",
+        "button[title*='next' i]",
+        "button:has-text('Next')",
+        "a:has-text('Next')",
+    ]
+    for sel in selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() == 0 or not btn.is_enabled():
+                continue
+            btn.scroll_into_view_if_needed()
+            btn.click()
+            for _ in range(25):
+                time.sleep(1)
+                dr = get_data_rows()
+                if dr and dr[0].inner_text() != prev_first:
+                    log.info(f"  Next page loaded by clicking '{sel}'")
+                    return page.locator("table tbody tr").all()
+            log.warning(f"  Clicked '{sel}' but the rows never changed")
+        except Exception as e:
+            log.warning(f"  Next click via '{sel}' failed: {e}")
+
+    # Couldn't find/use a Next button: log what buttons exist so we can pick the right selector
+    try:
+        labels = []
+        for b in page.locator("button, a[role='button']").all()[:40]:
+            labels.append(
+                f"[{(b.get_attribute('aria-label') or '').strip()}|{b.inner_text().strip()[:20]}]"
+            )
+        log.warning(f"  DIAG buttons on page: {' '.join(labels)}")
+    except Exception as e:
+        log.warning(f"  DIAG button listing failed: {e}")
+    return []
+
+
 def scrape_foreclosures(most_recent_date):
     """
     Returns (results, incomplete).
@@ -907,13 +964,27 @@ def scrape_foreclosures(most_recent_date):
         )
         page    = context.new_page()
 
+        def log_bad_response(resp):
+            try:
+                if resp.status >= 400 and "publicsearch.us" in resp.url:
+                    log.warning(f"  DIAG HTTP {resp.status} <- {resp.url[:160]}")
+            except Exception:
+                pass
+        page.on("response", log_bad_response)
+
         offset   = 0
         page_num = 1
 
         while not done:
             url  = BASE_URL.format(offset=offset)
             log.info(f"Loading page {page_num} (offset={offset})...")
-            rows = scrape_page_with_retry(page, url, page_num=page_num)
+            if page_num == 1:
+                rows = scrape_page_with_retry(page, url, page_num=page_num)
+            else:
+                rows = click_next_page(page)
+                if not rows:
+                    log.warning("  Next-button paging failed — falling back to direct URL")
+                    rows = scrape_page_with_retry(page, url, page_num=page_num)
             if not rows:
                 log.error(f"  Giving up on page {page_num} after retries.")
                 incomplete = True
@@ -998,7 +1069,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v19")
+    log.info("Bexar County Foreclosure Scraper v20")
     log.info("=" * 60)
 
     try:
