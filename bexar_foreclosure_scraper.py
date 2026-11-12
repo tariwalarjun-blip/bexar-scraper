@@ -1,11 +1,15 @@
 """
-Bexar County Foreclosure Scraper - v18
-Changes from v17:
-- Extracts DOC NUMBER from results listing page (already visible, was never captured)
-- Saves doc number to new column Y: "Doc Number"
-- All existing columns A-X unchanged
-- Enables trustee_lookup.py to go directly to bexar.tx.publicsearch.us/doc/{DOC_NUMBER}
-  without needing to re-search by address
+Bexar County Foreclosure Scraper - v19
+Changes from v18:
+- scrape_page_with_retry now logs URL, title, tr count, first 500 chars of body,
+  and saves a screenshot (debug_page{N}_attempt{M}.png) when 0 data rows come back
+- Realistic user agent + locale on the browser contexts (headless Chromium
+  otherwise announces itself as "HeadlessChrome")
+- 5 second pause between result pages
+- If a results page fails before the stop date is reached, the run is flagged
+  INCOMPLETE: rows already scraped are still processed, then the script raises
+  at the end so the GitHub Actions run goes red instead of looking fine
+- All sheet columns A-Y unchanged
 """
 
 import os
@@ -31,6 +35,12 @@ SHEET_TAB          = "Sheet1"
 REFILE_TAB         = "Refile Log"
 MAX_DAYS_BACK      = 30
 MIN_APPRAISAL      = 80000
+PAGE_DELAY_SECONDS = 5
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 CAD_SEARCH_URL = "https://bexar.trueautomation.com/clientdb/?cid=110"
 
@@ -835,16 +845,38 @@ def update_dates_and_reset_dk(sheet, row_index, recorded_date, sale_date):
 # Foreclosure scraper
 # ─────────────────────────────────────────────
 
-def scrape_page_with_retry(page, url, max_retries=3):
+def scrape_page_with_retry(page, url, max_retries=3, page_num=1):
     for attempt in range(1, max_retries + 1):
         if not goto_with_retry(page, url):
             return []
+
+        # Give the results table a chance to render before we count rows
+        try:
+            page.wait_for_selector("table tbody tr", timeout=15000)
+        except Exception:
+            pass
         time.sleep(3)
+
         rows      = page.locator("table tbody tr").all()
         data_rows = [r for r in rows
                      if re.search(r"\d{1,2}/\d{1,2}/\d{4}", r.inner_text())]
         if data_rows:
             return rows
+
+        # ── Diagnostics: what did the site actually give us? ──
+        try:
+            body = page.locator("body").inner_text()[:500].replace("\n", " | ")
+            log.warning(
+                f"  DIAG url={page.url} | title={page.title()} | tr_count={len(rows)}"
+            )
+            log.warning(f"  DIAG body: {body}")
+            page.screenshot(
+                path=f"debug_page{page_num}_attempt{attempt}.png", full_page=True
+            )
+        except Exception as e:
+            log.warning(f"  DIAG failed: {e}")
+        # ──────────────────────────────────────────────────────
+
         log.warning(f"  0 data rows on attempt {attempt}/{max_retries} — retrying in 10s...")
         time.sleep(10)
     log.error("  Page returned 0 rows after all retries.")
@@ -852,8 +884,14 @@ def scrape_page_with_retry(page, url, max_retries=3):
 
 
 def scrape_foreclosures(most_recent_date):
+    """
+    Returns (results, incomplete).
+    incomplete=True means a results page failed before we reached the stop date,
+    so some newer filings may be missing from this run.
+    """
     results     = []
     done        = False
+    incomplete  = False
     hard_cutoff = datetime.now() - timedelta(days=MAX_DAYS_BACK)
     if most_recent_date:
         most_recent_date = most_recent_date - timedelta(days=1)
@@ -862,7 +900,11 @@ def scrape_foreclosures(most_recent_date):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 900})
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=USER_AGENT,
+            locale="en-US",
+        )
         page    = context.new_page()
 
         offset   = 0
@@ -871,9 +913,10 @@ def scrape_foreclosures(most_recent_date):
         while not done:
             url  = BASE_URL.format(offset=offset)
             log.info(f"Loading page {page_num} (offset={offset})...")
-            rows = scrape_page_with_retry(page, url)
+            rows = scrape_page_with_retry(page, url, page_num=page_num)
             if not rows:
                 log.error(f"  Giving up on page {page_num} after retries.")
+                incomplete = True
                 break
 
             data_rows = 0
@@ -925,7 +968,7 @@ def scrape_foreclosures(most_recent_date):
                             "address":       address,
                             "recorded_date": recorded_date,
                             "sale_date":     sale_date,
-                            "doc_number":    doc_number,   # ← NEW
+                            "doc_number":    doc_number,
                         })
                         if doc_number:
                             log.info(f"  Captured doc URL ID: {doc_number} → {address}")
@@ -941,10 +984,12 @@ def scrape_foreclosures(most_recent_date):
                 break
             offset   += 50
             page_num += 1
+            log.info(f"  Pausing {PAGE_DELAY_SECONDS}s before next page...")
+            time.sleep(PAGE_DELAY_SECONDS)
 
         browser.close()
 
-    return results
+    return results, incomplete
 
 
 # ─────────────────────────────────────────────
@@ -953,7 +998,7 @@ def scrape_foreclosures(most_recent_date):
 
 def main():
     log.info("=" * 60)
-    log.info("Bexar County Foreclosure Scraper v18")
+    log.info("Bexar County Foreclosure Scraper v19")
     log.info("=" * 60)
 
     try:
@@ -967,7 +1012,7 @@ def main():
             f"Most recent date: {most_recent.strftime('%m/%d/%Y') if most_recent else 'none'}"
         )
 
-        foreclosures = scrape_foreclosures(most_recent)
+        foreclosures, incomplete = scrape_foreclosures(most_recent)
         log.info(f"Records to process: {len(foreclosures)}")
 
         new_count    = 0
@@ -976,7 +1021,11 @@ def main():
 
         with sync_playwright() as p:
             browser  = p.chromium.launch(headless=True)
-            context  = browser.new_context(viewport={"width": 1280, "height": 900})
+            context  = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent=USER_AGENT,
+                locale="en-US",
+            )
             cad_page = context.new_page()
 
             for f in foreclosures:
@@ -1102,6 +1151,15 @@ def main():
             f"Done. {new_count} new | {update_count} refiled | {skipped} skipped"
         )
         log.info("=" * 60)
+
+        # Loud failure: rows we did get were saved above, but some filings
+        # newer than the stop date were never loaded. Fail the run so it shows red.
+        if incomplete:
+            raise RuntimeError(
+                "INCOMPLETE RUN: a results page returned 0 rows before the stop "
+                "date was reached. Some recent filings were NOT scraped. "
+                "Check the DIAG lines and debug screenshots above."
+            )
 
     except Exception as e:
         log.error(f"SCRAPER CRASHED: {e}")
